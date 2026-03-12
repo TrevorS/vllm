@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast, overload
 
+import regex as re
 from mistral_common.protocol.instruct.request import (
     ChatCompletionRequest as MistralChatCompletionRequest,
 )
@@ -45,6 +46,7 @@ except ImportError:
     )
 
 if TYPE_CHECKING:
+    import llguidance as llg
     from transformers import BatchEncoding
 
 logger = init_logger(__name__)
@@ -230,6 +232,7 @@ def _tekken_token_to_id(tokenizer: "Tekkenizer", t: str | bytes) -> int:
 
 class MistralTokenizer(TokenizerLike):
     IS_MISTRAL_TOKENIZER = True  # used by vllm.utils.mistral
+    _cached_llg_tokenizer: "llg.LLTokenizer | None" = None
 
     @classmethod
     def from_pretrained(
@@ -348,6 +351,19 @@ class MistralTokenizer(TokenizerLike):
     @property
     def truncation_side(self) -> str:
         return self.transformers_tokenizer.truncation_side
+
+    @property
+    def llg_tokenizer(self) -> "llg.LLTokenizer | None":
+        return self._cached_llg_tokenizer
+
+    @llg_tokenizer.setter
+    def llg_tokenizer(self, llg_tokenizer: "llg.LLTokenizer") -> None:
+        import llguidance as llg
+
+        assert isinstance(llg_tokenizer, llg.LLTokenizer), (
+            f"Got {type(llg_tokenizer)} instead of `llg.LLTokenizer`"
+        )
+        self._cached_llg_tokenizer = llg_tokenizer
 
     def _is_special_token_id(self, token_id: int) -> bool:
         return token_id in self._special_token_ids_set
@@ -580,3 +596,74 @@ class MistralTokenizer(TokenizerLike):
             ]
 
         return tokens
+
+
+class MistralLLGTokenizer:
+    """Wraps a mistral tokenizer for use with llguidance."""
+
+    eos_token_id: int
+    bos_token_id: int
+    tokens: list[bytes]
+    special_token_ids: list[int]
+
+    def __init__(self, tokenizer: MistralTokenizer) -> None:
+        self._tokenizer = tokenizer.tokenizer
+        self.eos_token_id = self._tokenizer.eos_id
+        self.bos_token_id = self._tokenizer.bos_id
+
+        self.tokens: list[bytes] = []
+        self.special_token_ids: list[int] = []
+
+        seen_special_tokens: set[str] = set()
+        for i in range(self._tokenizer.n_words):
+            # Convert square brackets to angle brackets for special tokens,
+            # since llg only recognizes the latter.
+            if self._tokenizer.is_special(i):
+                token_rep = self._tokenizer.id_to_piece(i)
+                if match := re.fullmatch(r"\[(.*)\]", token_rep):
+                    token_rep_llg = f"<{match.group(1)}>"
+                else:
+                    token_rep_llg = token_rep
+
+                if not re.fullmatch(r"<.*>", token_rep_llg):
+                    raise ValueError(
+                        f"Invalid special token: {token_rep_llg} ({token_rep})"
+                    )
+                assert token_rep_llg not in seen_special_tokens, (
+                    token_rep_llg,
+                    seen_special_tokens,
+                )
+                seen_special_tokens.add(token_rep_llg)
+                self.special_token_ids.append(i)
+                self.tokens.append(token_rep_llg.encode("utf-8"))
+            else:
+                token = self._tokenizer.id_to_byte_piece(i, SpecialTokenPolicy.RAISE)
+                self.tokens.append(token)
+
+        assert len(self.special_token_ids) == self._tokenizer.num_special_tokens, (
+            len(self.special_token_ids),
+            self._tokenizer.num_special_tokens,
+        )
+
+    def __call__(self, s: str, *args, **kwds) -> list[int]:
+        # HACK: add a null byte to the start of the string to avoid the tokenizer
+        # absorbing the first character of tokens that start with "▁".
+        # we then ignore the first two tokens the "▁" and the null byte.
+        # This gives us the pure tokenized text without SentencePiece artifacts.
+        if isinstance(self._tokenizer, SentencePieceTokenizer):
+            return self._tokenizer.encode("\00" + s, bos=False, eos=False)[2:]
+        else:
+            return self._tokenizer.encode(s, bos=False, eos=False)
+
+
+def guidance_tokenizer_from_mistral_tokenizer(
+    tokenizer: MistralTokenizer,
+) -> "llg.LLTokenizer":
+    import llguidance as llg
+
+    if tokenizer.llg_tokenizer is not None:
+        return tokenizer.llg_tokenizer
+
+    tokenizer_data = MistralLLGTokenizer(tokenizer)
+    tokenizer.llg_tokenizer = llg.LLTokenizer(llg.TokenizerWrapper(tokenizer_data))
+    return tokenizer.llg_tokenizer
