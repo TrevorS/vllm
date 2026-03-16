@@ -45,7 +45,6 @@ from vllm.renderers.inputs.preprocess import (
     parse_model_prompt,
     prompt_to_seq,
 )
-<<<<<<< HEAD
             tokenizer = renderer.get_tokenizer()
             is_mistral_grammar = issubclass(
                 tool_parser,  # type: ignore[arg-type]
@@ -53,12 +52,9 @@ from vllm.renderers.inputs.preprocess import (
             ) and isinstance(tokenizer, MistralTokenizer)
             if tool_choice != "none" or is_mistral_grammar:
                 if not isinstance(request, ChatCompletionRequest | ResponsesRequest):
-||||||| parent of 5fee4b0 (Improvement)
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.mistral import MistralTokenizer
-=======
 from vllm.tokenizers import TokenizerLike
->>>>>>> 5fee4b0 (Improvement)
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import should_apply_mistral_grammar
 from vllm.utils import random_uuid
