@@ -743,7 +743,13 @@ def is_torch_equal(target: str) -> bool:
 HAS_OPAQUE_TYPE = is_torch_equal_or_newer("2.11.0.dev")
 
 if HAS_OPAQUE_TYPE:
-    from torch._opaque_base import OpaqueBase
+    try:
+        from torch._opaque_base import OpaqueBase
+    except ImportError:
+        # NGC PyTorch 26.02 (2.11.0a0) reports as >= 2.11 but is missing
+        # torch._opaque_base (added in upstream PyTorch 2.12).
+        OpaqueBase = object  # type: ignore[misc, assignment]
+        HAS_OPAQUE_TYPE = False
 else:
     OpaqueBase = object  # type: ignore[misc, assignment]
 
@@ -766,13 +772,18 @@ class ModuleName(OpaqueBase):  # type: ignore[misc]
         return hash(self.value)
 
     def __fx_repr__(self):
-        return (f"ModuleName({self.value!r})", {ModuleName})
+        # NGC PyTorch 26.02 expects dict, not set, for CUDA graph capture
+        return (f"ModuleName({self.value!r})", {"ModuleName": ModuleName})
 
 
 if HAS_OPAQUE_TYPE:
     from torch._library.opaque_object import register_opaque_type
 
-    register_opaque_type(ModuleName, typ="value", hoist=True)
+    try:
+        register_opaque_type(ModuleName, typ="value", hoist=True)
+    except TypeError:
+        # NGC PyTorch 26.02 doesn't support hoist kwarg
+        register_opaque_type(ModuleName, typ="value")
 
 
 # Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform
