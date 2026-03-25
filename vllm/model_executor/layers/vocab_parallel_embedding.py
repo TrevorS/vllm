@@ -1,3 +1,4 @@
+from vllm.model_executor.layers.linear import _nvfp4_should_convert, _nvfp4_convert_attention, _nvfp4_apply_attention  # noqa
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -66,6 +67,13 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if not getattr(layer, "_nvfp4_checked", False):
+            layer._nvfp4_checked = True
+            from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+            if isinstance(layer, ParallelLMHead) and _nvfp4_should_convert("lm_head"):
+                _nvfp4_convert_attention(layer)
+        if getattr(layer, "_use_nvfp4_attn", False):
+            return _nvfp4_apply_attention(layer, x, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

@@ -1,3 +1,4 @@
+from vllm.model_executor.layers.linear import _nvfp4_should_convert, _nvfp4_convert_attention, _nvfp4_apply_attention  # noqa
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -877,6 +878,10 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
+        prefix = getattr(layer, "prefix", "")
+        if _nvfp4_should_convert(prefix):
+            _nvfp4_convert_attention(layer)
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -915,6 +920,8 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         layer input.  See LinearMethodBase for param details
 
         """
+        if getattr(layer, "_use_nvfp4_attn", False):
+            return _nvfp4_apply_attention(layer, x, bias)
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
