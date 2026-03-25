@@ -432,7 +432,13 @@ class MistralTokenizer(TokenizerLike):
         # NOTE: This is for backward compatibility.
         # Transformers should be passed arguments it knows.
         if self.version >= 15:
-            version_kwargs["reasoning_effort"] = kwargs.get("reasoning_effort")
+            # mistral_common <= 1.10 doesn't support reasoning_effort
+            reasoning_effort = kwargs.get("reasoning_effort")
+            if reasoning_effort is not None:
+                try:
+                    version_kwargs["reasoning_effort"] = reasoning_effort
+                except Exception:
+                    pass
 
         messages, tools = _prepare_apply_chat_template_tools_and_messages(
             messages, tools, continue_final_message, add_generation_prompt
