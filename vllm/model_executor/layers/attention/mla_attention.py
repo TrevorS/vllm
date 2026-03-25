@@ -2495,10 +2495,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # model dtype input and will quantize internally.
             # For quantized layers (AWQ/GPTQ) that lack a .weight attribute,
             # use params_dtype which is the expected input dtype.
-            _kv_b_proj_w_dtype = (
+            # Marlin kernels repack weights to int32 — weight.dtype is NOT the
+            # expected input dtype. Use params_dtype (bf16) which is always the
+            # activation dtype the layer's apply() expects.
+            _kv_b_proj_w_dtype = getattr(
+                self.kv_b_proj, "params_dtype",
                 self.kv_b_proj.weight.dtype
                 if hasattr(self.kv_b_proj, "weight")
-                else self.kv_b_proj.params_dtype
+                else torch.bfloat16
             )
             if use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype():
                 kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)
