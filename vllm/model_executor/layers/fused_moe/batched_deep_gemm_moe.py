@@ -320,7 +320,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         """
         return (
             is_deep_gemm_e8m0_used()
-            and current_platform.is_device_capability_family(100)
+            and current_platform.is_blackwell_class()
         )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

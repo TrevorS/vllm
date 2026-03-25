@@ -212,16 +212,31 @@ def has_flashinfer_trtllm_fused_moe() -> bool:
 
 @functools.cache
 def has_flashinfer_cutlass_fused_moe() -> bool:
-    """Return `True` if FlashInfer CUTLASS fused MoE is available."""
+    """Return `True` if FlashInfer CUTLASS fused MoE engine is available.
+
+    Only checks for the core CUTLASS MoE entry point. FP4-specific
+    utilities are checked separately via has_flashinfer_nvfp4().
+    """
     if not has_flashinfer_moe():
         return False
 
-    # Check if all required functions are available
     required_functions = [
         ("flashinfer.fused_moe", "cutlass_fused_moe"),
+    ]
+
+    for module_name, attr_name in required_functions:
+        mod = _get_submodule(module_name)
+        if not mod or not hasattr(mod, attr_name):
+            return False
+    return True
+
+
+@functools.cache
+def has_flashinfer_nvfp4() -> bool:
+    """Return `True` if FlashInfer NVFP4 quantization utilities are available."""
+    required_functions = [
         ("flashinfer", "fp4_quantize"),
         ("flashinfer", "nvfp4_block_scale_interleave"),
-        ("flashinfer.fused_moe", "trtllm_fp4_block_scale_moe"),
     ]
 
     for module_name, attr_name in required_functions:
@@ -774,6 +789,7 @@ __all__ = [
     "has_flashinfer_nvlink_two_sided",
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",
+    "has_flashinfer_nvfp4",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",

@@ -1305,7 +1305,7 @@ def use_cudnn_prefill() -> bool:
     return (
         has_flashinfer()
         and vllm_config.attention_config.use_cudnn_prefill
-        and current_platform.is_device_capability_family(100)
+        and current_platform.is_blackwell_class()
         and has_nvidia_artifactory()
     )
 

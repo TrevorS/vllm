@@ -125,6 +125,19 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     return wrapper
 
 
+
+
+def _is_blackwell_class(device_capability: "DeviceCapability") -> bool:
+    """Check if a device capability represents a Blackwell-class GPU.
+
+    Blackwell architecture includes:
+    - SM100/SM101: B100, B200 (major=10)
+    - SM120/SM121: GB10 DGX Spark (major=12)
+
+    Note: SM11x may be used by future Blackwell variants.
+    """
+    return device_capability.major in (10, 11, 12)
+
 class CudaPlatformBase(Platform):
     _enum = PlatformEnum.CUDA
     device_name: str = "cuda"
