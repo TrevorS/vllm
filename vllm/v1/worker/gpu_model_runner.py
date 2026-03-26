@@ -6596,35 +6596,63 @@ class GPUModelRunner(
                     norm_bytes_per_block = bs * nh * 2  # float16
                     val_bytes_per_block = bs * nh * hd * vdtype_size
 
+                    qjl_sign_bytes_per_block = bs * nh * (hd // 8)
+                    qjl_rnorm_bytes_per_block = bs * nh * 2
+
                     total_key = nb * key_bytes_per_block
                     total_norm = nb * norm_bytes_per_block
                     total_val = nb * val_bytes_per_block
+                    total_qjl_sign = nb * qjl_sign_bytes_per_block
+                    total_qjl_rnorm = nb * qjl_rnorm_bytes_per_block
 
                     raw = raw_tensor
+                    off = 0
                     key_indices = (
-                        raw[:total_key]
+                        raw[off : off + total_key]
                         .view(torch.uint8)
                         .view(nb, bs, nh, packed_dim)
                     )
+                    off += total_key
                     norms = (
-                        raw[total_key : total_key + total_norm]
+                        raw[off : off + total_norm]
                         .view(torch.float16)
                         .view(nb, bs, nh)
                     )
+                    off += total_norm
                     # Values stored in model dtype (bf16)
                     value_dtype = kv_cache_spec.value_dtype
                     value_cache = (
-                        raw[total_key + total_norm :
-                            total_key + total_norm + total_val]
+                        raw[off : off + total_val]
                         .view(value_dtype)
                         .view(nb, bs, nh, hd)
                     )
+                    off += total_val
+                    # QJL sign bits and residual norms
+                    qjl_signs = (
+                        raw[off : off + total_qjl_sign]
+                        .view(torch.uint8)
+                        .view(nb, bs, nh, hd // 8)
+                    )
+                    off += total_qjl_sign
+                    qjl_rnorms = (
+                        raw[off : off + total_qjl_rnorm]
+                        .view(torch.float16)
+                        .view(nb, bs, nh)
+                    )
 
+                    # Shadow key cache for debug A/B testing
+                    key_cache_deq = torch.zeros(
+                        nb, bs, nh, hd,
+                        dtype=value_dtype, device=raw.device,
+                    )
                     kv_caches[layer_name] = TurboQuantCache(
                         key_indices=key_indices,
                         norms=norms,
                         value_cache=value_cache,
                         num_bits=kv_cache_spec.num_bits,
+                        qjl_signs=qjl_signs,
+                        qjl_residual_norms=qjl_rnorms,
+                        key_cache_deq=key_cache_deq,
                     )
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True

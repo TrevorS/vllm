@@ -224,7 +224,15 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
             * self.head_size
             * self.value_dtype_size
         )
-        return key_bytes + norm_bytes + value_bytes
+        # QJL: sign bits (1 bit per dim, packed into uint8) + residual norms
+        qjl_sign_bytes = (
+            self.block_size * self.num_kv_heads * (self.head_size // 8)
+        )
+        qjl_rnorm_bytes = self.block_size * self.num_kv_heads * 2
+        return (
+            key_bytes + norm_bytes + value_bytes
+            + qjl_sign_bytes + qjl_rnorm_bytes
+        )
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:

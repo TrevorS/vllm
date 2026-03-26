@@ -432,10 +432,69 @@ def kernel_unified_attention_2d(
             else:
                 S += scale * tl.dot(Q, K) * K_norms[None, :]
 
-            # QJL residual correction placeholder — will be enabled in
-            # Phase 3 once QJL storage is allocated in TurboQuantCache.
-            # if TQ_QJL:
-            #     (QJL correction code goes here)
+            # QJL residual correction: unbiased inner product estimate
+            if TQ_QJL:
+                TQ_HALF_SIGN_BYTES: tl.constexpr = HEAD_SIZE_PADDED // 16
+                d_half = tl.arange(0, HEAD_SIZE_PADDED // 2)
+                byte_idx_h = d_half // 8
+                bit_pos_h = 7 - (d_half % 8)
+                dim_mask_h = tl.where(
+                    d_half < HEAD_SIZE // 2, 1, 0
+                ).to(tl.int1)
+
+                qjl_base = (
+                    physical_block_idx[None, :] * stride_qjl_signs_0
+                    + kv_head_idx * stride_qjl_signs_2
+                    + (seq_offset % BLOCK_SIZE)[None, :]
+                    * stride_qjl_signs_1
+                )
+                # First half signs
+                sb_first = tl.load(
+                    tq_qjl_signs_ptr + qjl_base
+                    + byte_idx_h[:, None] * stride_qjl_signs_3,
+                    mask=dim_mask_h[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                signs_first = (
+                    ((sb_first >> bit_pos_h[:, None]) & 1) * 2 - 1
+                ).to(tl.float32)
+                # Second half signs
+                sb_second = tl.load(
+                    tq_qjl_signs_ptr + qjl_base
+                    + (byte_idx_h[:, None] + TQ_HALF_SIGN_BYTES)
+                    * stride_qjl_signs_3,
+                    mask=dim_mask_h[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                signs_second = (
+                    ((sb_second >> bit_pos_h[:, None]) & 1) * 2 - 1
+                ).to(tl.float32)
+
+                # Residual norms: [TILE_SIZE]
+                rnorm_offset = (
+                    physical_block_idx * stride_qjl_rnorms_0
+                    + kv_head_idx * stride_qjl_rnorms_2
+                    + (seq_offset % BLOCK_SIZE) * stride_qjl_rnorms_1
+                )
+                residual_norms = tl.load(
+                    tq_qjl_rnorms_ptr + rnorm_offset,
+                    mask=tile_mask,
+                    other=0.0,
+                ).to(tl.float32)
+
+                # sqrt(pi/2)/D * dot(Q_rot, signs) * r_norm * k_norm
+                TQ_QJL_CONST: tl.constexpr = 1.2533141373
+                qjl_dot = (
+                    tl.dot(Q_first.to(tl.float32), signs_first)
+                    + tl.dot(Q_second.to(tl.float32), signs_second)
+                )
+                S += (
+                    scale
+                    * (TQ_QJL_CONST / HEAD_SIZE)
+                    * qjl_dot
+                    * residual_norms[None, :]
+                    * K_norms[None, :]
+                )
         else:
             S += scale * tl.dot(Q, K)
 
@@ -904,10 +963,69 @@ def kernel_unified_attention_3d(
             else:
                 S += scale * tl.dot(Q, K) * K_norms[None, :]
 
-            # QJL residual correction placeholder — will be enabled in
-            # Phase 3 once QJL storage is allocated in TurboQuantCache.
-            # if TQ_QJL:
-            #     (QJL correction code goes here)
+            # QJL residual correction: unbiased inner product estimate
+            if TQ_QJL:
+                TQ_HALF_SIGN_BYTES: tl.constexpr = HEAD_SIZE_PADDED // 16
+                d_half = tl.arange(0, HEAD_SIZE_PADDED // 2)
+                byte_idx_h = d_half // 8
+                bit_pos_h = 7 - (d_half % 8)
+                dim_mask_h = tl.where(
+                    d_half < HEAD_SIZE // 2, 1, 0
+                ).to(tl.int1)
+
+                qjl_base = (
+                    physical_block_idx[None, :] * stride_qjl_signs_0
+                    + kv_head_idx * stride_qjl_signs_2
+                    + (seq_offset % BLOCK_SIZE)[None, :]
+                    * stride_qjl_signs_1
+                )
+                # First half signs
+                sb_first = tl.load(
+                    tq_qjl_signs_ptr + qjl_base
+                    + byte_idx_h[:, None] * stride_qjl_signs_3,
+                    mask=dim_mask_h[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                signs_first = (
+                    ((sb_first >> bit_pos_h[:, None]) & 1) * 2 - 1
+                ).to(tl.float32)
+                # Second half signs
+                sb_second = tl.load(
+                    tq_qjl_signs_ptr + qjl_base
+                    + (byte_idx_h[:, None] + TQ_HALF_SIGN_BYTES)
+                    * stride_qjl_signs_3,
+                    mask=dim_mask_h[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                signs_second = (
+                    ((sb_second >> bit_pos_h[:, None]) & 1) * 2 - 1
+                ).to(tl.float32)
+
+                # Residual norms: [TILE_SIZE]
+                rnorm_offset = (
+                    physical_block_idx * stride_qjl_rnorms_0
+                    + kv_head_idx * stride_qjl_rnorms_2
+                    + (seq_offset % BLOCK_SIZE) * stride_qjl_rnorms_1
+                )
+                residual_norms = tl.load(
+                    tq_qjl_rnorms_ptr + rnorm_offset,
+                    mask=tile_mask,
+                    other=0.0,
+                ).to(tl.float32)
+
+                # sqrt(pi/2)/D * dot(Q_rot, signs) * r_norm * k_norm
+                TQ_QJL_CONST: tl.constexpr = 1.2533141373
+                qjl_dot = (
+                    tl.dot(Q_first.to(tl.float32), signs_first)
+                    + tl.dot(Q_second.to(tl.float32), signs_second)
+                )
+                S += (
+                    scale
+                    * (TQ_QJL_CONST / HEAD_SIZE)
+                    * qjl_dot
+                    * residual_norms[None, :]
+                    * K_norms[None, :]
+                )
         else:
             S += scale * tl.dot(Q, K)
 
