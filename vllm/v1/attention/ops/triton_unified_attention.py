@@ -127,13 +127,6 @@ def kernel_unified_attention_2d(
     stride_qjl_rnorms_0: tl.int64 = 0,
     stride_qjl_rnorms_1: tl.int64 = 0,
     stride_qjl_rnorms_2: tl.int64 = 0,
-    TQ_OUTLIER: tl.constexpr = False,
-    tq_outlier_ptr=None,
-    stride_outlier_0: tl.int64 = 0,
-    stride_outlier_1: tl.int64 = 0,
-    stride_outlier_2: tl.int64 = 0,
-    stride_outlier_3: tl.constexpr = 1,
-    TQ_NUM_OUTLIER: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -178,45 +171,12 @@ def kernel_unified_attention_2d(
         other=0.0,
     )
 
-    # Init Q_outlier_part for Triton name resolution (overwritten if TQ_OUTLIER)
-    if TQ_NUM_OUTLIER > 0:
-        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
-    else:
-        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
-
-    # TurboQuant: Q rotation or outlier split
+    # TurboQuant: pre-rotate queries for centroid-space dot product.
+    # Identity: <q, R^T*c[idx]> = <R*q, c[idx]> = <q @ R, c[idx]>
     if TQ_KEYS:
         TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
         rot_offs_row = tl.arange(0, HEAD_SIZE_PADDED)
-        if TQ_OUTLIER:
-            # Q is pre-processed in Python as [Q_outlier | Q_normal_rot]
-            # and passed via query_ptr. Re-load split parts directly.
-            # Note: TQ_NUM_OUTLIER must be power of 2 (e.g., 32)
-            TQ_NORMAL_D: tl.constexpr = HEAD_SIZE_PADDED - TQ_NUM_OUTLIER
-            TQ_HALF_NORMAL: tl.constexpr = TQ_NORMAL_D // 2
-            q_base = query_offset_0[:, None] * query_stride_0 + query_offset_1[:, None] * query_stride_1
-            q_mask = query_mask_0[:, None] & query_mask_1[:, None]
-            # Outlier: first TQ_NUM_OUTLIER dims of pre-processed Q
-            # Use same offset as main Q load but restricted dim range
-            outlier_d = tl.arange(0, TQ_NUM_OUTLIER)
-            q_outlier_offset = q_base + outlier_d[None, :]
-            Q_outlier_part = tl.load(query_ptr + q_outlier_offset)
-            # Normal first half
-            nf_d = tl.arange(0, TQ_HALF_D) + TQ_NUM_OUTLIER
-            nf_mask = q_mask & (nf_d[None, :] < TQ_NUM_OUTLIER + TQ_HALF_NORMAL)
-            Q_first = tl.load(
-                query_ptr + q_base + nf_d[None, :],
-                mask=nf_mask, other=0.0,
-            )
-            # Normal second half
-            ns_d = tl.arange(0, TQ_HALF_D) + TQ_NUM_OUTLIER + TQ_HALF_NORMAL
-            ns_mask = q_mask & (ns_d[None, :] < HEAD_SIZE)
-            Q_second = tl.load(
-                query_ptr + q_base + ns_d[None, :],
-                mask=ns_mask, other=0.0,
-            )
-        elif TQ_PACKED or TQ_QJL:
-            pass  # Q_outlier_part initialized above
+        if TQ_PACKED or TQ_QJL:
             rot_col_first = tl.arange(0, TQ_HALF_D)
             rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
             # Load R^T directly (pre-transposed, row-major)
@@ -250,7 +210,6 @@ def kernel_unified_attention_2d(
                 other=0.0,
             )
             Q = tl.dot(Q.to(tl.float32), R_T).to(Q.dtype)
-            pass  # Q_outlier_part initialized above
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -265,7 +224,6 @@ def kernel_unified_attention_2d(
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
-    # Q_outlier_part initialized in TQ_KEYS block above (if TQ_OUTLIER)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -466,41 +424,7 @@ def kernel_unified_attention_2d(
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
         if TQ_KEYS:
-            if TQ_OUTLIER:
-                # Load outlier channels (FP16) from outlier cache
-                offs_outlier = tl.arange(0, TQ_NUM_OUTLIER)
-                outlier_offset = (
-                    physical_block_idx[None, :] * stride_outlier_0
-                    + kv_head_idx * stride_outlier_2
-                    + offs_outlier[:, None] * stride_outlier_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_outlier_1
-                )
-                outlier_mask = (
-                    (offs_outlier[:, None] < TQ_NUM_OUTLIER)
-                    & tile_mask[None, :]
-                )
-                K_outlier = tl.load(
-                    tq_outlier_ptr + outlier_offset,
-                    mask=outlier_mask,
-                    other=0.0,
-                ).to(Q.dtype)
-
-                outlier_dot = tl.dot(
-                    Q_outlier_part.to(tl.float32),
-                    K_outlier.to(tl.float32),
-                )
-                if TQ_PACKED:
-                    normal_dot = (
-                        tl.dot(Q_first, K_hi)
-                        + tl.dot(Q_second, K_lo)
-                    )
-                else:
-                    normal_dot = tl.dot(Q, K)  # unpacked outlier not yet impl
-                S += scale * (
-                    outlier_dot + normal_dot * K_norms[None, :]
-                )
-            elif TQ_PACKED:
+            if TQ_PACKED:
                 # Split-dot: first-half @ hi + second-half @ lo
                 S += scale * (
                     tl.dot(Q_first, K_hi) + tl.dot(Q_second, K_lo)
@@ -727,13 +651,6 @@ def kernel_unified_attention_3d(
     stride_qjl_rnorms_0: tl.int64 = 0,
     stride_qjl_rnorms_1: tl.int64 = 0,
     stride_qjl_rnorms_2: tl.int64 = 0,
-    TQ_OUTLIER: tl.constexpr = False,
-    tq_outlier_ptr=None,
-    stride_outlier_0: tl.int64 = 0,
-    stride_outlier_1: tl.int64 = 0,
-    stride_outlier_2: tl.int64 = 0,
-    stride_outlier_3: tl.constexpr = 1,
-    TQ_NUM_OUTLIER: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -789,12 +706,6 @@ def kernel_unified_attention_3d(
         other=0.0,
     )
 
-    # Init Q_outlier_part for Triton name resolution
-    if TQ_NUM_OUTLIER > 0:
-        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
-    else:
-        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
-
     # TurboQuant: pre-rotate Q (3D kernel)
     if TQ_KEYS:
         TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
@@ -833,7 +744,6 @@ def kernel_unified_attention_3d(
                 other=0.0,
             )
             Q = tl.dot(Q.to(tl.float32), R_T).to(Q.dtype)
-            pass  # Q_outlier_part initialized above
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -1045,41 +955,7 @@ def kernel_unified_attention_3d(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if TQ_KEYS:
-            if TQ_OUTLIER:
-                # Load outlier channels (FP16) from outlier cache
-                offs_outlier = tl.arange(0, TQ_NUM_OUTLIER)
-                outlier_offset = (
-                    physical_block_idx[None, :] * stride_outlier_0
-                    + kv_head_idx * stride_outlier_2
-                    + offs_outlier[:, None] * stride_outlier_3
-                    + (seq_offset % BLOCK_SIZE)[None, :]
-                    * stride_outlier_1
-                )
-                outlier_mask = (
-                    (offs_outlier[:, None] < TQ_NUM_OUTLIER)
-                    & tile_mask[None, :]
-                )
-                K_outlier = tl.load(
-                    tq_outlier_ptr + outlier_offset,
-                    mask=outlier_mask,
-                    other=0.0,
-                ).to(Q.dtype)
-
-                outlier_dot = tl.dot(
-                    Q_outlier_part.to(tl.float32),
-                    K_outlier.to(tl.float32),
-                )
-                if TQ_PACKED:
-                    normal_dot = (
-                        tl.dot(Q_first, K_hi)
-                        + tl.dot(Q_second, K_lo)
-                    )
-                else:
-                    normal_dot = tl.dot(Q, K)  # unpacked outlier not yet impl
-                S += scale * (
-                    outlier_dot + normal_dot * K_norms[None, :]
-                )
-            elif TQ_PACKED:
+            if TQ_PACKED:
                 # Split-dot: first-half @ hi + second-half @ lo
                 S += scale * (
                     tl.dot(Q_first, K_hi) + tl.dot(Q_second, K_lo)
@@ -1398,8 +1274,6 @@ def unified_attention(
     tq_packed=False,
     tq_qjl_signs=None,
     tq_qjl_rnorms=None,
-    tq_outlier_cache=None,
-    tq_num_outlier=0,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1548,13 +1422,6 @@ def unified_attention(
             stride_qjl_rnorms_0=tq_qjl_rnorms.stride(0) if tq_qjl_rnorms is not None else 0,
             stride_qjl_rnorms_1=tq_qjl_rnorms.stride(1) if tq_qjl_rnorms is not None else 0,
             stride_qjl_rnorms_2=tq_qjl_rnorms.stride(2) if tq_qjl_rnorms is not None else 0,
-            TQ_OUTLIER=tq_outlier_cache is not None,
-            tq_outlier_ptr=tq_outlier_cache,
-            stride_outlier_0=tq_outlier_cache.stride(0) if tq_outlier_cache is not None else 0,
-            stride_outlier_1=tq_outlier_cache.stride(1) if tq_outlier_cache is not None else 0,
-            stride_outlier_2=tq_outlier_cache.stride(2) if tq_outlier_cache is not None else 0,
-            stride_outlier_3=tq_outlier_cache.stride(3) if tq_outlier_cache is not None else 1,
-            TQ_NUM_OUTLIER=tq_num_outlier,
         )
     else:
         kernel_unified_attention_3d[
@@ -1626,13 +1493,6 @@ def unified_attention(
             stride_qjl_rnorms_0=tq_qjl_rnorms.stride(0) if tq_qjl_rnorms is not None else 0,
             stride_qjl_rnorms_1=tq_qjl_rnorms.stride(1) if tq_qjl_rnorms is not None else 0,
             stride_qjl_rnorms_2=tq_qjl_rnorms.stride(2) if tq_qjl_rnorms is not None else 0,
-            TQ_OUTLIER=tq_outlier_cache is not None,
-            tq_outlier_ptr=tq_outlier_cache,
-            stride_outlier_0=tq_outlier_cache.stride(0) if tq_outlier_cache is not None else 0,
-            stride_outlier_1=tq_outlier_cache.stride(1) if tq_outlier_cache is not None else 0,
-            stride_outlier_2=tq_outlier_cache.stride(2) if tq_outlier_cache is not None else 0,
-            stride_outlier_3=tq_outlier_cache.stride(3) if tq_outlier_cache is not None else 1,
-            TQ_NUM_OUTLIER=tq_num_outlier,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,

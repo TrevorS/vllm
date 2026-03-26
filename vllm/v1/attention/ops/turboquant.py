@@ -260,142 +260,6 @@ def dequantize_keys(
 
 
 # ---------------------------------------------------------------------------
-# Channel outlier detection
-# ---------------------------------------------------------------------------
-
-# Per-layer outlier channel indices, detected at first forward call.
-# Maps (layer_id, device) → (outlier_indices, normal_indices) int64 tensors.
-_OUTLIER_INDICES: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
-_OUTLIER_LAYER_COUNTER: int = 0
-
-
-def detect_outlier_channels(
-    keys: torch.Tensor,
-    num_outlier: int = 32,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Detect outlier channels by per-channel average magnitude.
-
-    Args:
-        keys: [num_tokens, num_kv_heads, head_dim]
-        num_outlier: number of outlier channels to detect
-
-    Returns:
-        outlier_indices: [num_outlier] int64
-        normal_indices: [head_dim - num_outlier] int64
-    """
-    # Average magnitude across tokens and heads
-    chan_mag = keys.float().abs().mean(dim=(0, 1))  # [head_dim]
-    _, sorted_idx = chan_mag.sort(descending=True)
-    outlier = sorted_idx[:num_outlier].sort().values
-    normal = sorted_idx[num_outlier:].sort().values
-    return outlier.to(torch.int64), normal.to(torch.int64)
-
-
-def get_outlier_indices(
-    layer_id: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Get cached outlier indices for a layer, or None if not yet detected."""
-    return _OUTLIER_INDICES.get((layer_id, device))
-
-
-def set_outlier_indices(
-    layer_id: int,
-    device: torch.device,
-    outlier: torch.Tensor,
-    normal: torch.Tensor,
-) -> None:
-    """Cache outlier indices for a layer."""
-    _OUTLIER_INDICES[(layer_id, device)] = (outlier, normal)
-
-
-def quantize_and_store_with_outliers(
-    keys: torch.Tensor,
-    outlier_cache: torch.Tensor,
-    normal_cache: torch.Tensor,
-    normal_norm_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    rotation_matrix: torch.Tensor,
-    boundaries: torch.Tensor,
-    block_size: int,
-    outlier_indices: torch.Tensor,
-    normal_indices: torch.Tensor,
-    num_bits: int = 4,
-    centroids: torch.Tensor | None = None,
-    qjl_sign_cache: torch.Tensor | None = None,
-    qjl_rnorm_cache: torch.Tensor | None = None,
-) -> None:
-    """Quantize keys with channel outlier separation.
-
-    Outlier channels stored as raw FP16. Normal channels quantized
-    with TQ using an independent rotation + norm.
-    """
-    # Split channels
-    key_outlier = keys[:, :, outlier_indices]  # [N, H, num_outlier]
-    key_normal = keys[:, :, normal_indices]    # [N, H, num_normal]
-
-    # Normal part: compute norm, normalize, rotate, quantize
-    normal_norms = key_normal.float().norm(dim=-1)  # [N, H]
-    safe_norms = normal_norms.clamp(min=1e-8)
-    key_normal_unit = key_normal.float() / safe_norms.unsqueeze(-1)
-
-    # Rotate normal part
-    rotated = torch.matmul(key_normal_unit, rotation_matrix.t())
-
-    # Quantize
-    indices = torch.searchsorted(
-        boundaries, rotated.reshape(-1)
-    ).reshape(rotated.shape).to(torch.uint8)
-
-    # Graph-safe scatter
-    safe_slots = slot_mapping.clamp(min=0)
-    block_idx = safe_slots // block_size
-    block_offset = safe_slots % block_size
-
-    # Store outlier channels as raw BF16/FP16
-    outlier_cache[block_idx, block_offset] = key_outlier.to(
-        outlier_cache.dtype
-    )
-
-    # Store normal part norms
-    normal_norm_cache[block_idx, block_offset] = normal_norms.to(
-        torch.float16
-    )
-
-    # Pack and store normal indices (padded to cache dim)
-    num_normal = indices.shape[-1]
-    cache_dim = normal_cache.shape[-1]
-    if num_bits == 4 and num_normal % 2 == 0:
-        first_half = indices[..., : num_normal // 2]
-        second_half = indices[..., num_normal // 2 :]
-        packed = ((first_half << 4) | second_half).to(torch.uint8)
-        # Pad if cache is larger (for kernel alignment)
-        if packed.shape[-1] < cache_dim:
-            pad = torch.zeros(
-                *packed.shape[:-1], cache_dim - packed.shape[-1],
-                dtype=torch.uint8, device=packed.device,
-            )
-            packed = torch.cat([packed, pad], dim=-1)
-        normal_cache[block_idx, block_offset] = packed
-    else:
-        normal_cache[block_idx, block_offset, :, :num_normal] = indices
-
-    # QJL on normal channels
-    if qjl_sign_cache is not None and centroids is not None:
-        rotated_approx = centroids[indices.long()]
-        residual = rotated - rotated_approx
-        sign_positive = (residual >= 0).to(torch.uint8)
-        D = sign_positive.shape[-1]
-        bits = sign_positive.reshape(
-            *sign_positive.shape[:-1], D // 8, 8
-        )
-        qjl_signs = _pack_sign_bits(bits)
-        qjl_rnorms = residual.norm(dim=-1).to(torch.float16)
-        qjl_sign_cache[block_idx, block_offset] = qjl_signs
-        qjl_rnorm_cache[block_idx, block_offset] = qjl_rnorms
-
-
-# ---------------------------------------------------------------------------
 # TurboQuantCache -- split K/V/norm container
 # ---------------------------------------------------------------------------
 
@@ -416,9 +280,6 @@ class TurboQuantCache:
         "num_bits",
         "qjl_signs",
         "qjl_residual_norms",
-        "outlier_cache",
-        "normal_norms",
-        "layer_id",
     )
 
     def __init__(
@@ -429,9 +290,6 @@ class TurboQuantCache:
         num_bits: int = 4,
         qjl_signs: torch.Tensor | None = None,
         qjl_residual_norms: torch.Tensor | None = None,
-        outlier_cache: torch.Tensor | None = None,
-        normal_norms: torch.Tensor | None = None,
-        layer_id: int = -1,
     ):
         self.key_indices = key_indices
         self.norms = norms
@@ -439,9 +297,6 @@ class TurboQuantCache:
         self.num_bits = num_bits
         self.qjl_signs = qjl_signs
         self.qjl_residual_norms = qjl_residual_norms
-        self.outlier_cache = outlier_cache
-        self.normal_norms = normal_norms
-        self.layer_id = layer_id
 
     @property
     def device(self) -> torch.device:
