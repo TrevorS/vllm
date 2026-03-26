@@ -6588,57 +6588,83 @@ class GPUModelRunner(
                     bs = kernel_block_size
                     nh = kv_cache_spec.num_kv_heads
                     hd = kv_cache_spec.head_size
-                    packed_dim = kv_cache_spec.packed_key_dim
+                    n_out = kv_cache_spec.num_outlier_channels
+                    n_norm = kv_cache_spec.num_normal_channels
+                    packed_norm_dim = kv_cache_spec.packed_normal_dim
                     vdtype_size = kv_cache_spec.value_dtype_size
-
-                    # Per-block byte sizes for split regions
-                    key_bytes_per_block = bs * nh * packed_dim
-                    norm_bytes_per_block = bs * nh * 2  # float16
-                    val_bytes_per_block = bs * nh * hd * vdtype_size
-
-                    qjl_sign_bytes_per_block = bs * nh * (hd // 8)
-                    qjl_rnorm_bytes_per_block = bs * nh * 2
-
-                    total_key = nb * key_bytes_per_block
-                    total_norm = nb * norm_bytes_per_block
-                    total_val = nb * val_bytes_per_block
-                    total_qjl_sign = nb * qjl_sign_bytes_per_block
-                    total_qjl_rnorm = nb * qjl_rnorm_bytes_per_block
+                    value_dtype = kv_cache_spec.value_dtype
 
                     raw = raw_tensor
                     off = 0
-                    key_indices = (
-                        raw[off : off + total_key]
-                        .view(torch.uint8)
-                        .view(nb, bs, nh, packed_dim)
+
+                    # Outlier cache: raw FP16
+                    sz = nb * bs * nh * n_out * 2
+                    outlier_cache = (
+                        raw[off : off + sz]
+                        .view(torch.float16)
+                        .view(nb, bs, nh, n_out)
                     )
-                    off += total_key
-                    norms = (
-                        raw[off : off + total_norm]
+                    off += sz
+
+                    # Normal indices: uint8 packed
+                    sz = nb * bs * nh * packed_norm_dim
+                    key_indices = (
+                        raw[off : off + sz]
+                        .view(torch.uint8)
+                        .view(nb, bs, nh, packed_norm_dim)
+                    )
+                    off += sz
+
+                    # Normal-part norms: float16
+                    sz = nb * bs * nh * 2
+                    normal_norms = (
+                        raw[off : off + sz]
                         .view(torch.float16)
                         .view(nb, bs, nh)
                     )
-                    off += total_norm
-                    # Values stored in model dtype (bf16)
-                    value_dtype = kv_cache_spec.value_dtype
+                    off += sz
+
+                    # Full norms (legacy): float16
+                    sz = nb * bs * nh * 2
+                    norms = (
+                        raw[off : off + sz]
+                        .view(torch.float16)
+                        .view(nb, bs, nh)
+                    )
+                    off += sz
+
+                    # Values: model dtype
+                    sz = nb * bs * nh * hd * vdtype_size
                     value_cache = (
-                        raw[off : off + total_val]
+                        raw[off : off + sz]
                         .view(value_dtype)
                         .view(nb, bs, nh, hd)
                     )
-                    off += total_val
-                    # QJL sign bits and residual norms
+                    off += sz
+
+                    # QJL on normal channels
+                    sz = nb * bs * nh * (n_norm // 8)
                     qjl_signs = (
-                        raw[off : off + total_qjl_sign]
+                        raw[off : off + sz]
                         .view(torch.uint8)
-                        .view(nb, bs, nh, hd // 8)
+                        .view(nb, bs, nh, n_norm // 8)
                     )
-                    off += total_qjl_sign
+                    off += sz
+
+                    sz = nb * bs * nh * 2
                     qjl_rnorms = (
-                        raw[off : off + total_qjl_rnorm]
+                        raw[off : off + sz]
                         .view(torch.float16)
                         .view(nb, bs, nh)
                     )
+
+                    # Assign layer IDs for outlier detection
+                    from vllm.v1.attention.ops.turboquant import (
+                        _OUTLIER_LAYER_COUNTER,
+                    )
+                    import vllm.v1.attention.ops.turboquant as _tq_mod
+                    layer_id = _tq_mod._OUTLIER_LAYER_COUNTER
+                    _tq_mod._OUTLIER_LAYER_COUNTER += 1
 
                     kv_caches[layer_name] = TurboQuantCache(
                         key_indices=key_indices,
@@ -6647,6 +6673,9 @@ class GPUModelRunner(
                         num_bits=kv_cache_spec.num_bits,
                         qjl_signs=qjl_signs,
                         qjl_residual_norms=qjl_rnorms,
+                        outlier_cache=outlier_cache,
+                        normal_norms=normal_norms,
+                        layer_id=layer_id,
                     )
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
