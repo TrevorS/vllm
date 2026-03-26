@@ -188,6 +188,65 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TurboQuantAttentionSpec(FullAttentionSpec):
+    """TurboQuant KV cache: split into key_indices + norms + values.
+
+    Keys are quantized to num_bits (3 or 4) via random rotation + Lloyd-Max.
+    Values are stored in value_dtype (BF16 by default).
+    """
+
+    num_bits: int = 4
+    value_dtype: torch.dtype = torch.bfloat16  # dtype for value cache
+    value_dtype_size: int = 2  # 2 for BF16, 1 for FP8
+
+    @property
+    def packed_key_dim(self) -> int:
+        """Packed key dimension per head (bytes in last dim)."""
+        if self.num_bits == 4:
+            return self.head_size // 2  # nibble: 2 indices per byte
+        elif self.num_bits == 3:
+            return self.head_size * 3 // 8  # 8 indices per 3 bytes
+        else:
+            return self.head_size  # unpacked
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        # Keys: uint8 index bytes (packed)
+        key_bytes = (
+            self.block_size * self.num_kv_heads * self.packed_key_dim
+        )
+        # Norms: float16 per position per head
+        norm_bytes = self.block_size * self.num_kv_heads * 2
+        # Values: BF16 or FP8
+        value_bytes = (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * self.value_dtype_size
+        )
+        return key_bytes + norm_bytes + value_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, TurboQuantAttentionSpec) for spec in specs)
+        num_bits_set = set(spec.num_bits for spec in specs)
+        assert len(num_bits_set) == 1, (
+            "All TurboQuant layers must use the same num_bits"
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            num_bits=num_bits_set.pop(),
+            value_dtype=specs[0].value_dtype,
+            value_dtype_size=specs[0].value_dtype_size,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None

@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    TurboQuantAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -524,6 +525,24 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
+            )
+        elif self.kv_cache_dtype in ("tq3", "tq4"):
+            from vllm.v1.attention.ops.turboquant import (
+                num_bits_from_dtype_str,
+            )
+
+            model_dtype = vllm_config.model_config.dtype
+            return TurboQuantAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                num_bits=num_bits_from_dtype_str(self.kv_cache_dtype),
+                value_dtype=model_dtype,
+                value_dtype_size=torch.tensor(
+                    [], dtype=model_dtype
+                ).element_size(),
             )
         else:
             return FullAttentionSpec(

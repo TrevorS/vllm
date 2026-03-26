@@ -268,6 +268,8 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "tq3",
+        "tq4",
     ]
 
     @staticmethod
@@ -470,6 +472,65 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        # TurboQuant: use the shadow key cache (dequantized lazily
+        # during do_kv_cache_update) for standard attention.
+        from vllm.v1.attention.ops.turboquant import TurboQuantCache
+
+        if isinstance(kv_cache, TurboQuantCache):
+            key_cache = kv_cache.key_cache_deq
+            value_cache = kv_cache.value_cache
+
+            cu_seqlens_q = attn_metadata.query_start_loc
+            seqused_k = attn_metadata.seq_lens
+            max_seqlen_q = attn_metadata.max_query_len
+            max_seqlen_k = attn_metadata.max_seq_len
+            block_table = attn_metadata.block_table
+
+            seq_threshold_3D = attn_metadata.seq_threshold_3D
+            num_par_softmax_segments = (
+                attn_metadata.num_par_softmax_segments
+            )
+            softmax_segm_output = attn_metadata.softmax_segm_output
+            softmax_segm_max = attn_metadata.softmax_segm_max
+            softmax_segm_expsum = attn_metadata.softmax_segm_expsum
+
+            descale_shape = (
+                cu_seqlens_q.shape[0] - 1,
+                key_cache.shape[2],
+            )
+            mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+            unified_attention(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                use_alibi_sqrt=self.use_alibi_sqrt,
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                q_descale=None,
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                seq_threshold_3D=seq_threshold_3D,
+                num_par_softmax_segments=num_par_softmax_segments,
+                softmax_segm_output=softmax_segm_output,
+                softmax_segm_max=softmax_segm_max,
+                softmax_segm_expsum=softmax_segm_expsum,
+                sinks=self.sinks,
+                output_scale=output_scale,
+                mm_prefix_range=mm_prefix_range_tensor,
+            )
+
+            return output
+
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
         if self.kv_cache_dtype.startswith("fp8"):
@@ -584,6 +645,48 @@ class TritonAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+
+        # TurboQuant: quantize keys and scatter into split cache
+        from vllm.v1.attention.ops.turboquant import TurboQuantCache
+
+        if isinstance(kv_cache, TurboQuantCache):
+            from vllm.v1.attention.ops.turboquant import (
+                get_turboquant_params,
+                quantize_and_store,
+            )
+
+            num_bits = kv_cache.num_bits
+            R, centroids, boundaries = get_turboquant_params(
+                self.head_size, num_bits, key.device
+            )
+            block_size = kv_cache.key_indices.shape[1]
+
+            quantize_and_store(
+                key,
+                kv_cache.key_indices,
+                kv_cache.norms,
+                slot_mapping,
+                R,
+                boundaries,
+                block_size,
+                num_bits=num_bits,
+                centroids=centroids,
+                qjl_sign_cache=kv_cache.qjl_signs,
+                qjl_rnorm_cache=kv_cache.qjl_residual_norms,
+            )
+
+            # Store values and dequantized keys via graph-safe scatter
+            safe_slots = slot_mapping.clamp(min=0)
+            block_idx = safe_slots // block_size
+            block_offset = safe_slots % block_size
+            kv_cache.value_cache[block_idx, block_offset] = value
+
+            # Also write dequantized keys to shadow cache
+            # (interim for quality validation — fused kernel removes this)
+            if kv_cache.key_cache_deq is not None:
+                kv_cache.key_cache_deq[block_idx, block_offset] = key
+            return
+
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
 

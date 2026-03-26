@@ -139,6 +139,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    TurboQuantAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -6574,7 +6575,67 @@ class GPUModelRunner(
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
-                if isinstance(kv_cache_spec, AttentionSpec):
+                if isinstance(kv_cache_spec, TurboQuantAttentionSpec):
+                    has_attn = True
+                    from vllm.v1.attention.ops.turboquant import (
+                        TurboQuantCache,
+                    )
+
+                    num_blocks_per_kv_block = (
+                        kv_cache_spec.block_size // kernel_block_size
+                    )
+                    nb = num_blocks * num_blocks_per_kv_block
+                    bs = kernel_block_size
+                    nh = kv_cache_spec.num_kv_heads
+                    hd = kv_cache_spec.head_size
+                    packed_dim = kv_cache_spec.packed_key_dim
+                    vdtype_size = kv_cache_spec.value_dtype_size
+
+                    # Per-block byte sizes for split regions
+                    key_bytes_per_block = bs * nh * packed_dim
+                    norm_bytes_per_block = bs * nh * 2  # float16
+                    val_bytes_per_block = bs * nh * hd * vdtype_size
+
+                    total_key = nb * key_bytes_per_block
+                    total_norm = nb * norm_bytes_per_block
+                    total_val = nb * val_bytes_per_block
+
+                    raw = raw_tensor
+                    key_indices = (
+                        raw[:total_key]
+                        .view(torch.uint8)
+                        .view(nb, bs, nh, packed_dim)
+                    )
+                    norms = (
+                        raw[total_key : total_key + total_norm]
+                        .view(torch.float16)
+                        .view(nb, bs, nh)
+                    )
+                    # Values stored in model dtype (bf16)
+                    value_dtype = kv_cache_spec.value_dtype
+                    value_cache = (
+                        raw[total_key + total_norm :
+                            total_key + total_norm + total_val]
+                        .view(value_dtype)
+                        .view(nb, bs, nh, hd)
+                    )
+
+                    # Shadow dequantized key cache for interim
+                    # quality validation (fused kernel will remove this)
+                    key_cache_deq = torch.zeros(
+                        nb, bs, nh, hd,
+                        dtype=value_dtype,
+                        device=raw.device,
+                    )
+
+                    kv_caches[layer_name] = TurboQuantCache(
+                        key_indices=key_indices,
+                        norms=norms,
+                        value_cache=value_cache,
+                        num_bits=kv_cache_spec.num_bits,
+                        key_cache_deq=key_cache_deq,
+                    )
+                elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
