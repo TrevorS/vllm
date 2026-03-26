@@ -472,13 +472,24 @@ class TritonAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # TurboQuant: use the shadow key cache (dequantized lazily
-        # during do_kv_cache_update) for standard attention.
+        # TurboQuant: fused kernel reads quantized key indices directly
         from vllm.v1.attention.ops.turboquant import TurboQuantCache
 
         if isinstance(kv_cache, TurboQuantCache):
-            key_cache = kv_cache.key_cache_deq
+            from vllm.v1.attention.ops.turboquant import (
+                get_turboquant_params,
+            )
+
+            num_bits = kv_cache.num_bits
+            R, centroids, boundaries = get_turboquant_params(
+                self.head_size, num_bits, query.device
+            )
+
+            # Key cache = packed uint8 indices, value cache = model dtype
+            key_cache = kv_cache.key_indices
             value_cache = kv_cache.value_cache
+            packed_dim = key_cache.shape[-1]
+            is_packed = (num_bits == 4 and packed_dim == self.head_size // 2)
 
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -527,6 +538,14 @@ class TritonAttentionImpl(AttentionImpl):
                 sinks=self.sinks,
                 output_scale=output_scale,
                 mm_prefix_range=mm_prefix_range_tensor,
+                # TurboQuant fused kernel params
+                tq_norm_cache=kv_cache.norms,
+                tq_centroids=centroids,
+                tq_rotation_matrix=R,
+                tq_num_centroids=1 << num_bits,
+                tq_packed=is_packed,
+                tq_qjl_signs=kv_cache.qjl_signs,
+                tq_qjl_rnorms=kv_cache.qjl_residual_norms,
             )
 
             return output
@@ -675,16 +694,11 @@ class TritonAttentionImpl(AttentionImpl):
                 qjl_rnorm_cache=kv_cache.qjl_residual_norms,
             )
 
-            # Store values and dequantized keys via graph-safe scatter
+            # Store values via graph-safe scatter
             safe_slots = slot_mapping.clamp(min=0)
             block_idx = safe_slots // block_size
             block_offset = safe_slots % block_size
             kv_cache.value_cache[block_idx, block_offset] = value
-
-            # Also write dequantized keys to shadow cache
-            # (interim for quality validation — fused kernel removes this)
-            if kv_cache.key_cache_deq is not None:
-                kv_cache.key_cache_deq[block_idx, block_offset] = key
             return
 
         # For decoder and cross-attention, use KV cache as before

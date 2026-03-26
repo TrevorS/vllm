@@ -107,6 +107,26 @@ def kernel_unified_attention_2d(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # TurboQuant parameters
+    TQ_KEYS: tl.constexpr = False,
+    tq_norm_cache_ptr=None,
+    tq_centroids_ptr=None,
+    tq_rotation_ptr=None,
+    stride_norm_cache_0: tl.int64 = 0,
+    stride_norm_cache_1: tl.int64 = 0,
+    stride_norm_cache_2: tl.int64 = 0,
+    TQ_NUM_CENTROIDS: tl.constexpr = 16,
+    TQ_PACKED: tl.constexpr = False,
+    TQ_QJL: tl.constexpr = False,
+    tq_qjl_signs_ptr=None,
+    tq_qjl_rnorms_ptr=None,
+    stride_qjl_signs_0: tl.int64 = 0,
+    stride_qjl_signs_1: tl.int64 = 0,
+    stride_qjl_signs_2: tl.int64 = 0,
+    stride_qjl_signs_3: tl.constexpr = 1,
+    stride_qjl_rnorms_0: tl.int64 = 0,
+    stride_qjl_rnorms_1: tl.int64 = 0,
+    stride_qjl_rnorms_2: tl.int64 = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -150,6 +170,44 @@ def kernel_unified_attention_2d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+
+    # TurboQuant: pre-rotate queries for centroid-space dot product.
+    # Identity: <q, R^T*c[idx]> = <R*q, c[idx]> = <q @ R, c[idx]>
+    if TQ_KEYS:
+        TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
+        rot_offs_row = tl.arange(0, HEAD_SIZE_PADDED)
+        if TQ_PACKED or TQ_QJL:
+            rot_col_first = tl.arange(0, TQ_HALF_D)
+            rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
+            R_first = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_first[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_col_first[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            R_second = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_second[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_col_second[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            Q_first = tl.dot(Q.to(tl.float32), R_first).to(Q.dtype)
+            Q_second = tl.dot(Q.to(tl.float32), R_second).to(Q.dtype)
+        else:
+            rot_offs_col = tl.arange(0, HEAD_SIZE_PADDED)
+            R = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_offs_col[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_offs_col[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            Q = tl.dot(Q.to(tl.float32), R).to(Q.dtype)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -252,20 +310,65 @@ def kernel_unified_attention_2d(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
+        # K : (HEAD_SIZE, TILE_SIZE) or TQ centroid gather
+        if TQ_KEYS:
+            if TQ_PACKED:
+                # Nibble-packed TQ4: head_size//2 uint8 per position
+                offs_d_packed = tl.arange(0, TQ_HALF_D)
+                packed_dim_mask = tl.where(
+                    offs_d_packed < HEAD_SIZE // 2, 1, 0
+                ).to(tl.int1)
+                k_packed_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d_packed[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_packed = tl.load(
+                    key_cache_ptr + k_packed_offset,
+                    mask=packed_dim_mask[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                K_hi = tl.load(
+                    tq_centroids_ptr + ((K_packed >> 4) & 0xF)
+                ).to(Q.dtype)
+                K_lo = tl.load(
+                    tq_centroids_ptr + (K_packed & 0xF)
+                ).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                # Unpacked: direct uint8 index → centroid
+                K_idx = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0,
+                )
+                K = tl.load(
+                    tq_centroids_ptr + K_idx.to(tl.int32)
+                ).to(Q.dtype)
+            # Per-position key norms: [TILE_SIZE]
+            norm_offset = (
+                physical_block_idx * stride_norm_cache_0
+                + kv_head_idx * stride_norm_cache_2
+                + (seq_offset % BLOCK_SIZE) * stride_norm_cache_1
+            )
+            K_norms = tl.load(
+                tq_norm_cache_ptr + norm_offset,
+                mask=tile_mask,
+                other=0.0,
+            ).to(tl.float32)
         else:
-            K = K_load
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
+                K = K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -318,7 +421,21 @@ def kernel_unified_attention_2d(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-        S += scale * tl.dot(Q, K)
+        if TQ_KEYS:
+            if TQ_PACKED:
+                # Split-dot: first-half @ hi + second-half @ lo
+                S += scale * (
+                    tl.dot(Q_first, K_hi) + tl.dot(Q_second, K_lo)
+                ) * K_norms[None, :]
+            else:
+                S += scale * tl.dot(Q, K) * K_norms[None, :]
+
+            # QJL residual correction placeholder — will be enabled in
+            # Phase 3 once QJL storage is allocated in TurboQuantCache.
+            # if TQ_QJL:
+            #     (QJL correction code goes here)
+        else:
+            S += scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -453,6 +570,26 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    # TurboQuant parameters (3D kernel: unpacked only, no split-dot/QJL)
+    TQ_KEYS: tl.constexpr = False,
+    tq_norm_cache_ptr=None,
+    tq_centroids_ptr=None,
+    tq_rotation_ptr=None,
+    stride_norm_cache_0: tl.int64 = 0,
+    stride_norm_cache_1: tl.int64 = 0,
+    stride_norm_cache_2: tl.int64 = 0,
+    TQ_NUM_CENTROIDS: tl.constexpr = 16,
+    TQ_PACKED: tl.constexpr = False,
+    TQ_QJL: tl.constexpr = False,
+    tq_qjl_signs_ptr=None,
+    tq_qjl_rnorms_ptr=None,
+    stride_qjl_signs_0: tl.int64 = 0,
+    stride_qjl_signs_1: tl.int64 = 0,
+    stride_qjl_signs_2: tl.int64 = 0,
+    stride_qjl_signs_3: tl.constexpr = 1,
+    stride_qjl_rnorms_0: tl.int64 = 0,
+    stride_qjl_rnorms_1: tl.int64 = 0,
+    stride_qjl_rnorms_2: tl.int64 = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -507,6 +644,43 @@ def kernel_unified_attention_3d(
         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
         other=0.0,
     )
+
+    # TurboQuant: pre-rotate Q (3D kernel)
+    if TQ_KEYS:
+        TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
+        rot_offs_row = tl.arange(0, HEAD_SIZE_PADDED)
+        if TQ_PACKED or TQ_QJL:
+            rot_col_first = tl.arange(0, TQ_HALF_D)
+            rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
+            R_first = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_first[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_col_first[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            R_second = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_second[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_col_second[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            Q_first = tl.dot(Q.to(tl.float32), R_first).to(Q.dtype)
+            Q_second = tl.dot(Q.to(tl.float32), R_second).to(Q.dtype)
+        else:
+            rot_offs_col = tl.arange(0, HEAD_SIZE_PADDED)
+            R = tl.load(
+                tq_rotation_ptr
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_offs_col[None, :],
+                mask=(rot_offs_row[:, None] < HEAD_SIZE)
+                & (rot_offs_col[None, :] < HEAD_SIZE),
+                other=0.0,
+            )
+            Q = tl.dot(Q.to(tl.float32), R).to(Q.dtype)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -607,20 +781,65 @@ def kernel_unified_attention_3d(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-
-        if K_load.dtype.is_fp8():
-            if Q.dtype.is_fp8():
-                K = K_load
+        # K : (HEAD_SIZE, TILE_SIZE) or TQ centroid gather
+        if TQ_KEYS:
+            if TQ_PACKED:
+                # Nibble-packed TQ4: head_size//2 uint8 per position
+                offs_d_packed = tl.arange(0, TQ_HALF_D)
+                packed_dim_mask = tl.where(
+                    offs_d_packed < HEAD_SIZE // 2, 1, 0
+                ).to(tl.int1)
+                k_packed_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d_packed[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                K_packed = tl.load(
+                    key_cache_ptr + k_packed_offset,
+                    mask=packed_dim_mask[:, None] & tile_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                K_hi = tl.load(
+                    tq_centroids_ptr + ((K_packed >> 4) & 0xF)
+                ).to(Q.dtype)
+                K_lo = tl.load(
+                    tq_centroids_ptr + (K_packed & 0xF)
+                ).to(Q.dtype)
             else:
-                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+                # Unpacked: direct uint8 index → centroid
+                K_idx = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0,
+                )
+                K = tl.load(
+                    tq_centroids_ptr + K_idx.to(tl.int32)
+                ).to(Q.dtype)
+            # Per-position key norms: [TILE_SIZE]
+            norm_offset = (
+                physical_block_idx * stride_norm_cache_0
+                + kv_head_idx * stride_norm_cache_2
+                + (seq_offset % BLOCK_SIZE) * stride_norm_cache_1
+            )
+            K_norms = tl.load(
+                tq_norm_cache_ptr + norm_offset,
+                mask=tile_mask,
+                other=0.0,
+            ).to(tl.float32)
         else:
-            K = K_load
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            if K_load.dtype.is_fp8():
+                if Q.dtype.is_fp8():
+                    K = K_load
+                else:
+                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+            else:
+                K = K_load.to(Q.dtype)
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
@@ -672,7 +891,21 @@ def kernel_unified_attention_3d(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        if TQ_KEYS:
+            if TQ_PACKED:
+                # Split-dot: first-half @ hi + second-half @ lo
+                S += scale * (
+                    tl.dot(Q_first, K_hi) + tl.dot(Q_second, K_lo)
+                ) * K_norms[None, :]
+            else:
+                S += scale * tl.dot(Q, K) * K_norms[None, :]
+
+            # QJL residual correction placeholder — will be enabled in
+            # Phase 3 once QJL storage is allocated in TurboQuantCache.
+            # if TQ_QJL:
+            #     (QJL correction code goes here)
+        else:
+            S += scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -911,6 +1144,14 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    # TurboQuant parameters
+    tq_norm_cache=None,
+    tq_centroids=None,
+    tq_rotation_matrix=None,
+    tq_num_centroids=16,
+    tq_packed=False,
+    tq_qjl_signs=None,
+    tq_qjl_rnorms=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1040,6 +1281,25 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            # TurboQuant
+            TQ_KEYS=tq_norm_cache is not None,
+            tq_norm_cache_ptr=tq_norm_cache,
+            tq_centroids_ptr=tq_centroids,
+            tq_rotation_ptr=tq_rotation_matrix,
+            stride_norm_cache_0=tq_norm_cache.stride(0) if tq_norm_cache is not None else 0,
+            stride_norm_cache_1=tq_norm_cache.stride(1) if tq_norm_cache is not None else 0,
+            stride_norm_cache_2=tq_norm_cache.stride(2) if tq_norm_cache is not None else 0,
+            TQ_NUM_CENTROIDS=tq_num_centroids,
+            TQ_PACKED=tq_packed,
+            TQ_QJL=tq_qjl_signs is not None,
+            tq_qjl_signs_ptr=tq_qjl_signs,
+            tq_qjl_rnorms_ptr=tq_qjl_rnorms,
+            stride_qjl_signs_0=tq_qjl_signs.stride(0) if tq_qjl_signs is not None else 0,
+            stride_qjl_signs_1=tq_qjl_signs.stride(1) if tq_qjl_signs is not None else 0,
+            stride_qjl_signs_2=tq_qjl_signs.stride(2) if tq_qjl_signs is not None else 0,
+            stride_qjl_rnorms_0=tq_qjl_rnorms.stride(0) if tq_qjl_rnorms is not None else 0,
+            stride_qjl_rnorms_1=tq_qjl_rnorms.stride(1) if tq_qjl_rnorms is not None else 0,
+            stride_qjl_rnorms_2=tq_qjl_rnorms.stride(2) if tq_qjl_rnorms is not None else 0,
         )
     else:
         kernel_unified_attention_3d[
@@ -1112,4 +1372,23 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            # TurboQuant (3D kernel: unpacked only for now)
+            TQ_KEYS=tq_norm_cache is not None,
+            tq_norm_cache_ptr=tq_norm_cache,
+            tq_centroids_ptr=tq_centroids,
+            tq_rotation_ptr=tq_rotation_matrix,
+            stride_norm_cache_0=tq_norm_cache.stride(0) if tq_norm_cache is not None else 0,
+            stride_norm_cache_1=tq_norm_cache.stride(1) if tq_norm_cache is not None else 0,
+            stride_norm_cache_2=tq_norm_cache.stride(2) if tq_norm_cache is not None else 0,
+            TQ_NUM_CENTROIDS=tq_num_centroids,
+            TQ_PACKED=tq_packed,
+            TQ_QJL=tq_qjl_signs is not None,
+            tq_qjl_signs_ptr=tq_qjl_signs,
+            tq_qjl_rnorms_ptr=tq_qjl_rnorms,
+            stride_qjl_signs_0=tq_qjl_signs.stride(0) if tq_qjl_signs is not None else 0,
+            stride_qjl_signs_1=tq_qjl_signs.stride(1) if tq_qjl_signs is not None else 0,
+            stride_qjl_signs_2=tq_qjl_signs.stride(2) if tq_qjl_signs is not None else 0,
+            stride_qjl_rnorms_0=tq_qjl_rnorms.stride(0) if tq_qjl_rnorms is not None else 0,
+            stride_qjl_rnorms_1=tq_qjl_rnorms.stride(1) if tq_qjl_rnorms is not None else 0,
+            stride_qjl_rnorms_2=tq_qjl_rnorms.stride(2) if tq_qjl_rnorms is not None else 0,
         )

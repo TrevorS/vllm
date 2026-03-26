@@ -6620,20 +6620,11 @@ class GPUModelRunner(
                         .view(nb, bs, nh, hd)
                     )
 
-                    # Shadow dequantized key cache for interim
-                    # quality validation (fused kernel will remove this)
-                    key_cache_deq = torch.zeros(
-                        nb, bs, nh, hd,
-                        dtype=value_dtype,
-                        device=raw.device,
-                    )
-
                     kv_caches[layer_name] = TurboQuantCache(
                         key_indices=key_indices,
                         norms=norms,
                         value_cache=value_cache,
                         num_bits=kv_cache_spec.num_bits,
-                        key_cache_deq=key_cache_deq,
                     )
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True

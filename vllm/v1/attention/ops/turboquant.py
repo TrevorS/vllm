@@ -271,17 +271,12 @@ class TurboQuantCache:
     Only triton_attn backend knows how to unwrap this -- all other
     backends never see it (TQ is only in triton_attn's supported list).
 
-    Includes a shadow dequantized key cache (key_cache_deq) that is
-    updated incrementally during do_kv_cache_update. This avoids
-    materializing the entire cache on every forward pass.
-    Phase 1 quality validation only -- fused kernel will replace this.
     """
 
     __slots__ = (
         "key_indices",
         "norms",
         "value_cache",
-        "key_cache_deq",
         "num_bits",
         "qjl_signs",
         "qjl_residual_norms",
@@ -295,7 +290,6 @@ class TurboQuantCache:
         num_bits: int = 4,
         qjl_signs: torch.Tensor | None = None,
         qjl_residual_norms: torch.Tensor | None = None,
-        key_cache_deq: torch.Tensor | None = None,
     ):
         self.key_indices = key_indices
         self.norms = norms
@@ -303,7 +297,6 @@ class TurboQuantCache:
         self.num_bits = num_bits
         self.qjl_signs = qjl_signs
         self.qjl_residual_norms = qjl_residual_norms
-        self.key_cache_deq = key_cache_deq
 
     @property
     def device(self) -> torch.device:
