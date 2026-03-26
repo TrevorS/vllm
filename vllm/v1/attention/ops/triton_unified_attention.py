@@ -178,6 +178,12 @@ def kernel_unified_attention_2d(
         other=0.0,
     )
 
+    # Init Q_outlier_part for Triton name resolution (overwritten if TQ_OUTLIER)
+    if TQ_NUM_OUTLIER > 0:
+        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
+    else:
+        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
+
     # TurboQuant: Q rotation or outlier split
     if TQ_KEYS:
         TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
@@ -191,20 +197,10 @@ def kernel_unified_attention_2d(
             q_base = query_offset_0[:, None] * query_stride_0 + query_offset_1[:, None] * query_stride_1
             q_mask = query_mask_0[:, None] & query_mask_1[:, None]
             # Outlier: first TQ_NUM_OUTLIER dims of pre-processed Q
+            # Use same offset as main Q load but restricted dim range
             outlier_d = tl.arange(0, TQ_NUM_OUTLIER)
-            outlier_q_offset = (
-                query_offset_0[:, None] * query_stride_0
-                + query_offset_1[:, None] * query_stride_1
-                + outlier_d[None, :]
-            )
-            outlier_q_mask = (
-                query_mask_0[:, None] & query_mask_1[:, None]
-                & (outlier_d[None, :] < TQ_NUM_OUTLIER)
-            )
-            Q_outlier_part = tl.load(
-                query_ptr + outlier_q_offset,
-                mask=outlier_q_mask, other=0.0,
-            )
+            q_outlier_offset = q_base + outlier_d[None, :]
+            Q_outlier_part = tl.load(query_ptr + q_outlier_offset)
             # Normal first half
             nf_d = tl.arange(0, TQ_HALF_D) + TQ_NUM_OUTLIER
             nf_mask = q_mask & (nf_d[None, :] < TQ_NUM_OUTLIER + TQ_HALF_NORMAL)
@@ -269,10 +265,7 @@ def kernel_unified_attention_2d(
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
-    if TQ_NUM_OUTLIER > 0:
-        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
-    else:
-        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
+    # Q_outlier_part initialized in TQ_KEYS block above (if TQ_OUTLIER)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -493,8 +486,10 @@ def kernel_unified_attention_2d(
                     other=0.0,
                 ).to(Q.dtype)
 
-                # Outlier dot (raw) + normal dot (TQ) * normal_norm
-                outlier_dot = tl.dot(Q_outlier_part, K_outlier)
+                outlier_dot = tl.dot(
+                    Q_outlier_part.to(tl.float32),
+                    K_outlier.to(tl.float32),
+                )
                 if TQ_PACKED:
                     normal_dot = (
                         tl.dot(Q_first, K_hi)
@@ -794,6 +789,12 @@ def kernel_unified_attention_3d(
         other=0.0,
     )
 
+    # Init Q_outlier_part for Triton name resolution
+    if TQ_NUM_OUTLIER > 0:
+        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
+    else:
+        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
+
     # TurboQuant: pre-rotate Q (3D kernel)
     if TQ_KEYS:
         TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
@@ -850,10 +851,6 @@ def kernel_unified_attention_3d(
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
-    if TQ_NUM_OUTLIER > 0:
-        Q_outlier_part = tl.zeros([BLOCK_M, TQ_NUM_OUTLIER], dtype=Q.dtype)
-    else:
-        Q_outlier_part = tl.zeros([BLOCK_M, 1], dtype=Q.dtype)
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
@@ -1068,8 +1065,10 @@ def kernel_unified_attention_3d(
                     other=0.0,
                 ).to(Q.dtype)
 
-                # Outlier dot (raw) + normal dot (TQ) * normal_norm
-                outlier_dot = tl.dot(Q_outlier_part, K_outlier)
+                outlier_dot = tl.dot(
+                    Q_outlier_part.to(tl.float32),
+                    K_outlier.to(tl.float32),
+                )
                 if TQ_PACKED:
                     normal_dot = (
                         tl.dot(Q_first, K_hi)

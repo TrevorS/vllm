@@ -591,7 +591,7 @@ class TritonAttentionImpl(AttentionImpl):
                 tq_outlier_cache=(kv_cache.outlier_cache
                                   if use_outliers else None),
                 tq_num_outlier=(outlier_idx.shape[0]
-                                if use_outliers else 0),
+                                if use_outliers else 32),
             )
 
             return output
