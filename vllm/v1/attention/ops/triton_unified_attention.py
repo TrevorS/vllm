@@ -1274,6 +1274,8 @@ def unified_attention(
     tq_packed=False,
     tq_qjl_signs=None,
     tq_qjl_rnorms=None,
+    tq_outlier_cache=None,
+    tq_num_outlier=32,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"

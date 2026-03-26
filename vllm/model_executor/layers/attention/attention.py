@@ -526,12 +526,17 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 sliding_window=self.sliding_window,
             )
-        elif self.kv_cache_dtype in ("tq3", "tq4"):
+        elif self.kv_cache_dtype in ("tq3", "tq4", "tq4o"):
             from vllm.v1.attention.ops.turboquant import (
                 num_bits_from_dtype_str,
             )
 
             model_dtype = vllm_config.model_config.dtype
+            # tq4o: outlier separation (1/4 of head_dim channels)
+            n_outlier = (
+                max(self.head_size // 4, 16)
+                if self.kv_cache_dtype == "tq4o" else 0
+            )
             return TurboQuantAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -539,6 +544,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 num_bits=num_bits_from_dtype_str(self.kv_cache_dtype),
+                num_outlier_channels=n_outlier,
                 value_dtype=model_dtype,
                 value_dtype_size=torch.tensor(
                     [], dtype=model_dtype

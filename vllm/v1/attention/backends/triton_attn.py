@@ -270,6 +270,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "tq3",
         "tq4",
+        "tq4o",
     ]
 
     @staticmethod
@@ -481,18 +482,44 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
             num_bits = kv_cache.num_bits
-            R, centroids, boundaries = get_turboquant_params(
-                self.head_size, num_bits, query.device
-            )
-            # Pre-transpose R for the kernel (avoids in-kernel transpose)
-            R_T = R.t().contiguous()
-
-            # Key cache = packed uint8 indices, value cache = model dtype
             key_cache = kv_cache.key_indices
             value_cache = kv_cache.value_cache
             packed_dim = key_cache.shape[-1]
-            is_packed = (num_bits == 4
-                         and packed_dim == self.head_size // 2)
+
+            if kv_cache.use_outliers and kv_cache.outlier_cache is not None:
+                # Outlier mode: get outlier indices, 96-dim R,
+                # pre-process Q as [outlier_raw | normal_rot]
+                from vllm.v1.attention.ops.turboquant import (
+                    get_or_detect_outlier_indices,
+                )
+                n_out = kv_cache.outlier_cache.shape[-1]
+                # Use layer 0's outlier indices as proxy (they're similar)
+                # Real detection happens in do_kv_cache_update
+                outlier_idx, normal_idx = get_or_detect_outlier_indices(
+                    0, query[:num_actual_tokens], n_out,
+                )
+                n_normal = normal_idx.shape[0]
+                R_n, centroids_tq, _ = get_turboquant_params(
+                    n_normal, num_bits, query.device,
+                )
+                R_n_T = R_n.t().contiguous()
+                q_act = query[:num_actual_tokens]
+                Q_out = q_act[:, :, outlier_idx]
+                Q_norm_rot = torch.matmul(
+                    q_act[:, :, normal_idx].float(), R_n_T
+                ).to(query.dtype)
+                q_processed = torch.cat([Q_out, Q_norm_rot], dim=-1)
+                is_packed = (num_bits == 4
+                             and packed_dim == self.head_size // 2)
+            else:
+                # Standard TQ: full-dim R, no outlier separation
+                R, centroids_tq, _ = get_turboquant_params(
+                    self.head_size, num_bits, query.device,
+                )
+                R_n_T = R.t().contiguous()
+                q_processed = query[:num_actual_tokens]
+                is_packed = (num_bits == 4
+                             and packed_dim == self.head_size // 2)
 
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -515,7 +542,7 @@ class TritonAttentionImpl(AttentionImpl):
             mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
             unified_attention(
-                q=query[:num_actual_tokens],
+                q=q_processed,
                 k=key_cache,
                 v=value_cache,
                 out=output[:num_actual_tokens],
@@ -542,13 +569,22 @@ class TritonAttentionImpl(AttentionImpl):
                 output_scale=output_scale,
                 mm_prefix_range=mm_prefix_range_tensor,
                 # TurboQuant fused kernel params
-                tq_norm_cache=kv_cache.norms,
-                tq_centroids=centroids,
-                tq_rotation_matrix=R_T,
+                tq_norm_cache=(kv_cache.normal_norms
+                               if kv_cache.use_outliers
+                               else kv_cache.norms),
+                tq_centroids=centroids_tq,
+                tq_rotation_matrix=R_n_T,
                 tq_num_centroids=1 << num_bits,
                 tq_packed=is_packed,
                 tq_qjl_signs=kv_cache.qjl_signs,
                 tq_qjl_rnorms=kv_cache.qjl_residual_norms,
+                # Outlier params (only active for tq4o)
+                tq_outlier_cache=(kv_cache.outlier_cache
+                                  if kv_cache.use_outliers
+                                  else None),
+                tq_num_outlier=(kv_cache.outlier_cache.shape[-1]
+                                if kv_cache.use_outliers
+                                else 32),
             )
 
             return output
@@ -678,26 +714,41 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
             num_bits = kv_cache.num_bits
-            R, centroids, boundaries = get_turboquant_params(
-                self.head_size, num_bits, key.device
-            )
             block_size = kv_cache.key_indices.shape[1]
 
-            quantize_and_store(
-                key,
-                kv_cache.key_indices,
-                kv_cache.norms,
-                slot_mapping,
-                R,
-                boundaries,
-                block_size,
-                num_bits=num_bits,
-                centroids=centroids,
-                qjl_sign_cache=kv_cache.qjl_signs,
-                qjl_rnorm_cache=kv_cache.qjl_residual_norms,
-            )
+            if kv_cache.use_outliers and kv_cache.outlier_cache is not None:
+                from vllm.v1.attention.ops.turboquant import (
+                    get_or_detect_outlier_indices,
+                    quantize_and_store_outlier,
+                )
+                n_out = kv_cache.outlier_cache.shape[-1]
+                outlier_idx, normal_idx = get_or_detect_outlier_indices(
+                    0, key, n_out,  # layer 0 proxy
+                )
+                n_normal = normal_idx.shape[0]
+                R_n, centroids_n, boundaries_n = get_turboquant_params(
+                    n_normal, num_bits, key.device,
+                )
+                quantize_and_store_outlier(
+                    key, kv_cache.outlier_cache,
+                    kv_cache.key_indices, kv_cache.normal_norms,
+                    slot_mapping, R_n, boundaries_n, block_size,
+                    outlier_idx, normal_idx,
+                    num_bits=num_bits, centroids=centroids_n,
+                )
+            else:
+                R, centroids, boundaries = get_turboquant_params(
+                    self.head_size, num_bits, key.device,
+                )
+                quantize_and_store(
+                    key, kv_cache.key_indices, kv_cache.norms,
+                    slot_mapping, R, boundaries, block_size,
+                    num_bits=num_bits, centroids=centroids,
+                    qjl_sign_cache=kv_cache.qjl_signs,
+                    qjl_rnorm_cache=kv_cache.qjl_residual_norms,
+                )
 
-            # Store values via graph-safe scatter
+            # Store values
             safe_slots = slot_mapping.clamp(min=0)
             block_idx = safe_slots // block_size
             block_offset = safe_slots % block_size

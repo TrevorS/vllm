@@ -22,6 +22,7 @@ CacheDType = Literal[
     "fp8_ds_mla",
     "tq3",
     "tq4",
+    "tq4o",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]

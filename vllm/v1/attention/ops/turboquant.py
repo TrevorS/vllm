@@ -158,7 +158,7 @@ def num_bits_from_dtype_str(kv_cache_dtype: str) -> int:
     """Extract bit width from cache dtype string."""
     if kv_cache_dtype == "tq3":
         return 3
-    elif kv_cache_dtype == "tq4":
+    elif kv_cache_dtype in ("tq4", "tq4o"):
         return 4
     else:
         raise ValueError(f"Unknown TurboQuant dtype: {kv_cache_dtype}")
@@ -280,6 +280,9 @@ class TurboQuantCache:
         "num_bits",
         "qjl_signs",
         "qjl_residual_norms",
+        "outlier_cache",
+        "normal_norms",
+        "use_outliers",
     )
 
     def __init__(
@@ -290,6 +293,9 @@ class TurboQuantCache:
         num_bits: int = 4,
         qjl_signs: torch.Tensor | None = None,
         qjl_residual_norms: torch.Tensor | None = None,
+        outlier_cache: torch.Tensor | None = None,
+        normal_norms: torch.Tensor | None = None,
+        use_outliers: bool = False,
     ):
         self.key_indices = key_indices
         self.norms = norms
@@ -297,6 +303,9 @@ class TurboQuantCache:
         self.num_bits = num_bits
         self.qjl_signs = qjl_signs
         self.qjl_residual_norms = qjl_residual_norms
+        self.outlier_cache = outlier_cache
+        self.normal_norms = normal_norms
+        self.use_outliers = use_outliers
 
     @property
     def device(self) -> torch.device:
@@ -494,3 +503,103 @@ def dequantize_cache_blocks(
     keys_approx = keys_approx * flat_norms.float().unsqueeze(-1)
 
     return keys_approx.reshape(shape).to(target_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Channel outlier separation (opt-in via tq4o)
+# ---------------------------------------------------------------------------
+
+# Per-layer outlier channel indices (detected at first real batch).
+_OUTLIER_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_OUTLIER_COUNTER: int = 0
+
+
+def get_next_outlier_layer_id() -> int:
+    """Get a unique layer ID for outlier detection."""
+    global _OUTLIER_COUNTER
+    lid = _OUTLIER_COUNTER
+    _OUTLIER_COUNTER += 1
+    return lid
+
+
+def detect_outlier_channels(
+    keys: torch.Tensor,
+    num_outlier: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Detect outlier channels by per-channel average magnitude."""
+    chan_mag = keys.float().abs().mean(dim=(0, 1))
+    _, sorted_idx = chan_mag.sort(descending=True)
+    outlier = sorted_idx[:num_outlier].sort().values
+    normal = sorted_idx[num_outlier:].sort().values
+    return outlier.to(torch.int64), normal.to(torch.int64)
+
+
+def get_or_detect_outlier_indices(
+    layer_id: int,
+    keys: torch.Tensor,
+    num_outlier: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get cached outlier indices or detect from keys."""
+    if layer_id in _OUTLIER_CACHE:
+        return _OUTLIER_CACHE[layer_id]
+    outlier, normal = detect_outlier_channels(keys, num_outlier)
+    _OUTLIER_CACHE[layer_id] = (outlier, normal)
+    return outlier, normal
+
+
+def quantize_and_store_outlier(
+    keys: torch.Tensor,
+    outlier_cache: torch.Tensor,
+    normal_cache: torch.Tensor,
+    normal_norm_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    rotation_matrix: torch.Tensor,
+    boundaries: torch.Tensor,
+    block_size: int,
+    outlier_indices: torch.Tensor,
+    normal_indices: torch.Tensor,
+    num_bits: int = 4,
+    centroids: torch.Tensor | None = None,
+) -> None:
+    """Store outlier channels raw, quantize normal channels with TQ."""
+    key_outlier = keys[:, :, outlier_indices]
+    key_normal = keys[:, :, normal_indices]
+
+    # Normal: normalize, rotate, quantize
+    normal_norms = key_normal.float().norm(dim=-1)
+    safe_norms = normal_norms.clamp(min=1e-8)
+    key_normal_unit = key_normal.float() / safe_norms.unsqueeze(-1)
+    rotated = torch.matmul(key_normal_unit, rotation_matrix.t())
+    indices = torch.searchsorted(
+        boundaries, rotated.reshape(-1)
+    ).reshape(rotated.shape).to(torch.uint8)
+
+    # Scatter
+    safe_slots = slot_mapping.clamp(min=0)
+    block_idx = safe_slots // block_size
+    block_offset = safe_slots % block_size
+
+    # Store outlier raw
+    outlier_cache[block_idx, block_offset] = key_outlier.to(
+        outlier_cache.dtype
+    )
+    # Store normal norms
+    normal_norm_cache[block_idx, block_offset] = normal_norms.to(
+        torch.float16
+    )
+    # Pack and store normal indices (pad to cache dim)
+    num_normal = indices.shape[-1]
+    cache_dim = normal_cache.shape[-1]
+    if num_bits == 4 and num_normal % 2 == 0:
+        first = indices[..., : num_normal // 2]
+        second = indices[..., num_normal // 2 :]
+        packed = ((first << 4) | second).to(torch.uint8)
+        if packed.shape[-1] < cache_dim:
+            pad = torch.zeros(
+                *packed.shape[:-1], cache_dim - packed.shape[-1],
+                dtype=torch.uint8, device=packed.device,
+            )
+            packed = torch.cat([packed, pad], dim=-1)
+        normal_cache[block_idx, block_offset] = packed
+    else:
+        normal_cache[block_idx, block_offset] = indices

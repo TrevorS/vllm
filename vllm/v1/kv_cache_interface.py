@@ -196,27 +196,37 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
     """
 
     num_bits: int = 4
-    value_dtype: torch.dtype = torch.bfloat16  # dtype for value cache
-    value_dtype_size: int = 2  # 2 for BF16, 1 for FP8
+    num_outlier_channels: int = 0  # >0 for tq4o (outlier separation)
+    value_dtype: torch.dtype = torch.bfloat16
+    value_dtype_size: int = 2
+
+    @property
+    def num_normal_channels(self) -> int:
+        return self.head_size - self.num_outlier_channels
 
     @property
     def packed_key_dim(self) -> int:
-        """Packed key dimension per head (bytes in last dim)."""
-        if self.num_bits == 4:
-            return self.head_size // 2  # nibble: 2 indices per byte
-        else:
-            # TQ3 and others: unpacked uint8, 1 byte per index
-            # (3-bit packing in kernel is future optimization)
-            return self.head_size
+        """Packed key dimension for normal channels (padded to head_size//2)."""
+        # Kernel uses TQ_HALF_D = HEAD_SIZE_PADDED // 2 for arange
+        return self.head_size // 2
 
     @property
     def real_page_size_bytes(self) -> int:
-        # Keys: uint8 index bytes (packed)
-        key_bytes = (
+        n_out = self.num_outlier_channels
+        n_norm = self.num_normal_channels
+
+        # Outlier channels: raw BF16 (only if outlier mode)
+        outlier_bytes = self.block_size * self.num_kv_heads * n_out * 2
+        # Normal channel indices: packed uint8
+        normal_idx_bytes = (
             self.block_size * self.num_kv_heads * self.packed_key_dim
         )
-        # Norms: float16 per position per head
+        # Norms: float16 (full norms for non-outlier, normal norms for outlier)
         norm_bytes = self.block_size * self.num_kv_heads * 2
+        # Normal-part norms (only if outlier mode)
+        normal_norm_bytes = (
+            self.block_size * self.num_kv_heads * 2 if n_out > 0 else 0
+        )
         # Values: BF16 or FP8
         value_bytes = (
             self.block_size
@@ -224,13 +234,15 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
             * self.head_size
             * self.value_dtype_size
         )
-        # QJL: sign bits (1 bit per dim, packed into uint8) + residual norms
+        # QJL on normal channels
+        qjl_dim = n_norm if n_out > 0 else self.head_size
         qjl_sign_bytes = (
-            self.block_size * self.num_kv_heads * (self.head_size // 8)
+            self.block_size * self.num_kv_heads * (qjl_dim // 8)
         )
         qjl_rnorm_bytes = self.block_size * self.num_kv_heads * 2
         return (
-            key_bytes + norm_bytes + value_bytes
+            outlier_bytes + normal_idx_bytes + norm_bytes
+            + normal_norm_bytes + value_bytes
             + qjl_sign_bytes + qjl_rnorm_bytes
         )
 
@@ -249,6 +261,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
             dtype=specs[0].dtype,
             page_size_padded=specs[0].page_size_padded,
             num_bits=num_bits_set.pop(),
+            num_outlier_channels=specs[0].num_outlier_channels,
             value_dtype=specs[0].value_dtype,
             value_dtype_size=specs[0].value_dtype_size,
         )
