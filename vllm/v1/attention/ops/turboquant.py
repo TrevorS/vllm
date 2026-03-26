@@ -447,16 +447,8 @@ def quantize_and_store(
         second_half = indices[..., head_dim // 2 :]
         packed = ((first_half << 4) | second_half).to(torch.uint8)
         key_cache[block_idx, block_offset] = packed
-    elif num_bits == 3:
-        # TQ3: 3-bit packing -- 8 indices per 3 bytes, first/second half
-        head_dim = indices.shape[-1]
-        first_half = indices[..., : head_dim // 2]
-        second_half = indices[..., head_dim // 2 :]
-        packed_first = _pack_3bit_group(first_half)
-        packed_second = _pack_3bit_group(second_half)
-        packed = torch.cat([packed_first, packed_second], dim=-1)
-        key_cache[block_idx, block_offset] = packed
     else:
+        # TQ3 and others: unpacked uint8, 1 byte per index
         key_cache[block_idx, block_offset] = indices
 
     norm_cache[block_idx, block_offset] = norms

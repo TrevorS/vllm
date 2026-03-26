@@ -204,10 +204,10 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         """Packed key dimension per head (bytes in last dim)."""
         if self.num_bits == 4:
             return self.head_size // 2  # nibble: 2 indices per byte
-        elif self.num_bits == 3:
-            return self.head_size * 3 // 8  # 8 indices per 3 bytes
         else:
-            return self.head_size  # unpacked
+            # TQ3 and others: unpacked uint8, 1 byte per index
+            # (3-bit packing in kernel is future optimization)
+            return self.head_size
 
     @property
     def real_page_size_bytes(self) -> int:
