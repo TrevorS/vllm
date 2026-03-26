@@ -362,15 +362,23 @@ def quantize_and_store_with_outliers(
         torch.float16
     )
 
-    # Pack and store normal indices
+    # Pack and store normal indices (padded to cache dim)
     num_normal = indices.shape[-1]
+    cache_dim = normal_cache.shape[-1]
     if num_bits == 4 and num_normal % 2 == 0:
         first_half = indices[..., : num_normal // 2]
         second_half = indices[..., num_normal // 2 :]
         packed = ((first_half << 4) | second_half).to(torch.uint8)
+        # Pad if cache is larger (for kernel alignment)
+        if packed.shape[-1] < cache_dim:
+            pad = torch.zeros(
+                *packed.shape[:-1], cache_dim - packed.shape[-1],
+                dtype=torch.uint8, device=packed.device,
+            )
+            packed = torch.cat([packed, pad], dim=-1)
         normal_cache[block_idx, block_offset] = packed
     else:
-        normal_cache[block_idx, block_offset] = indices
+        normal_cache[block_idx, block_offset, :, :num_normal] = indices
 
     # QJL on normal channels
     if qjl_sign_cache is not None and centroids is not None:

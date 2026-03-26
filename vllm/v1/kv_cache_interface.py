@@ -206,11 +206,11 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
 
     @property
     def packed_normal_dim(self) -> int:
-        """Packed dimension for normal (non-outlier) channels."""
-        n = self.num_normal_channels
-        if self.num_bits == 4 and n % 2 == 0:
-            return n // 2  # nibble packed
-        return n  # unpacked
+        """Packed dimension for normal (non-outlier) channels.
+        Padded to head_size//2 for kernel compatibility."""
+        # Kernel uses TQ_HALF_D = HEAD_SIZE_PADDED // 2 for loading.
+        # Pad to match so the kernel's arange/mask works correctly.
+        return self.head_size // 2
 
     @property
     def real_page_size_bytes(self) -> int:
