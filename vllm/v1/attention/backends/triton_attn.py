@@ -487,18 +487,12 @@ class TritonAttentionImpl(AttentionImpl):
             # Pre-transpose R for the kernel (avoids in-kernel transpose)
             R_T = R.t().contiguous()
 
-            # Setup vars needed for both debug and main path
-            value_cache = kv_cache.value_cache
+            # Key cache = packed uint8 indices, value cache = model dtype
             key_cache = kv_cache.key_indices
+            value_cache = kv_cache.value_cache
             packed_dim = key_cache.shape[-1]
             is_packed = (num_bits == 4
                          and packed_dim == self.head_size // 2)
-
-            # Use shadow cache (raw keys) for quality until per-layer
-            # quantization control is added. TQ4 without QJL has
-            # insufficient quality for layers with large key norms.
-            # The fused kernel IS correct but TQ4's inherent error
-            # overwhelms score differences in early layers.
 
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -520,30 +514,9 @@ class TritonAttentionImpl(AttentionImpl):
             )
             mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
-            # DEBUG: verify store→read roundtrip for first layer
-            if not hasattr(self, '_tq_verified'):
-                self._tq_verified = True
-                import sys
-                bt = attn_metadata.block_table
-                sl = attn_metadata.seq_lens
-                blk = bt[0, 0].item()
-                slen = sl[0].item()
-                print(f"[TQ VERIFY] blk={blk} seq_len={slen} num_actual={num_actual_tokens}", file=sys.stderr, flush=True)
-                if slen > 0:
-                    # Read stored data at first position
-                    ki_stored = kv_cache.key_indices[blk, 0, 0, :4]
-                    n_stored = kv_cache.norms[blk, 0, 0]
-                    v_stored = kv_cache.value_cache[blk, 0, 0, :4]
-                    print(f"[TQ VERIFY] key_indices[{blk},0,0,:4]={ki_stored}", file=sys.stderr, flush=True)
-                    print(f"[TQ VERIFY] norms[{blk},0,0]={n_stored}", file=sys.stderr, flush=True)
-                    print(f"[TQ VERIFY] values[{blk},0,0,:4]={v_stored}", file=sys.stderr, flush=True)
-                    # Also check: are all positions 0..slen-1 populated?
-                    all_norms = kv_cache.norms[blk, :slen, :]
-                    print(f"[TQ VERIFY] norms for pos 0..{slen-1}: {all_norms}", file=sys.stderr, flush=True)
-
             unified_attention(
                 q=query[:num_actual_tokens],
-                k=kv_cache.key_cache_deq,
+                k=key_cache,
                 v=value_cache,
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
@@ -558,9 +531,7 @@ class TritonAttentionImpl(AttentionImpl):
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 q_descale=None,
-                k_descale=layer._k_scale.expand(
-                    (cu_seqlens_q.shape[0] - 1,
-                     kv_cache.key_cache_deq.shape[2])),
+                k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
                 seq_threshold_3D=seq_threshold_3D,
                 num_par_softmax_segments=num_par_softmax_segments,
@@ -570,6 +541,14 @@ class TritonAttentionImpl(AttentionImpl):
                 sinks=self.sinks,
                 output_scale=output_scale,
                 mm_prefix_range=mm_prefix_range_tensor,
+                # TurboQuant fused kernel params
+                tq_norm_cache=kv_cache.norms,
+                tq_centroids=centroids,
+                tq_rotation_matrix=R_T,
+                tq_num_centroids=1 << num_bits,
+                tq_packed=is_packed,
+                tq_qjl_signs=kv_cache.qjl_signs,
+                tq_qjl_rnorms=kv_cache.qjl_residual_norms,
             )
 
             return output
@@ -723,8 +702,6 @@ class TritonAttentionImpl(AttentionImpl):
             block_idx = safe_slots // block_size
             block_offset = safe_slots % block_size
             kv_cache.value_cache[block_idx, block_offset] = value
-            if kv_cache.key_cache_deq is not None:
-                kv_cache.key_cache_deq[block_idx, block_offset] = key
             return
 
         # For decoder and cross-attention, use KV cache as before

@@ -6640,11 +6640,6 @@ class GPUModelRunner(
                         .view(nb, bs, nh)
                     )
 
-                    # Shadow key cache for debug A/B testing
-                    key_cache_deq = torch.zeros(
-                        nb, bs, nh, hd,
-                        dtype=value_dtype, device=raw.device,
-                    )
                     kv_caches[layer_name] = TurboQuantCache(
                         key_indices=key_indices,
                         norms=norms,
@@ -6652,7 +6647,6 @@ class GPUModelRunner(
                         num_bits=kv_cache_spec.num_bits,
                         qjl_signs=qjl_signs,
                         qjl_residual_norms=qjl_rnorms,
-                        key_cache_deq=key_cache_deq,
                     )
                 elif isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True

@@ -280,7 +280,6 @@ class TurboQuantCache:
         "num_bits",
         "qjl_signs",
         "qjl_residual_norms",
-        "key_cache_deq",
     )
 
     def __init__(
@@ -291,7 +290,6 @@ class TurboQuantCache:
         num_bits: int = 4,
         qjl_signs: torch.Tensor | None = None,
         qjl_residual_norms: torch.Tensor | None = None,
-        key_cache_deq: torch.Tensor | None = None,
     ):
         self.key_indices = key_indices
         self.norms = norms
@@ -299,7 +297,6 @@ class TurboQuantCache:
         self.num_bits = num_bits
         self.qjl_signs = qjl_signs
         self.qjl_residual_norms = qjl_residual_norms
-        self.key_cache_deq = key_cache_deq
 
     @property
     def device(self) -> torch.device:
