@@ -494,80 +494,11 @@ class TritonAttentionImpl(AttentionImpl):
             is_packed = (num_bits == 4
                          and packed_dim == self.head_size // 2)
 
-            # DEBUG: A/B test fused vs raw on first real forward call
-            if not hasattr(self, '_tq_ab_done'):
-                self._tq_ab_done = True
-                import sys
-                sl = attn_metadata.seq_lens
-                if sl[0].item() > 1:  # skip warmup (seq_len=1)
-                    raw_out = torch.empty_like(
-                        output[:num_actual_tokens]
-                    )
-                    # Run with raw keys (known correct)
-                    unified_attention(
-                        q=query[:num_actual_tokens],
-                        k=kv_cache.key_cache_deq,
-                        v=value_cache,
-                        out=raw_out,
-                        cu_seqlens_q=attn_metadata.query_start_loc,
-                        max_seqlen_q=attn_metadata.max_query_len,
-                        seqused_k=sl,
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table,
-                        softcap=self.logits_soft_cap,
-                        q_descale=None,
-                        k_descale=layer._k_scale.expand(
-                            (attn_metadata.query_start_loc.shape[0]-1,
-                             kv_cache.key_cache_deq.shape[2])),
-                        v_descale=layer._v_scale.expand(
-                            (attn_metadata.query_start_loc.shape[0]-1,
-                             value_cache.shape[2])),
-                    )
-                    # Run fused kernel
-                    fused_out = torch.empty_like(
-                        output[:num_actual_tokens]
-                    )
-                    unified_attention(
-                        q=query[:num_actual_tokens],
-                        k=kv_cache.key_indices,
-                        v=value_cache,
-                        out=fused_out,
-                        cu_seqlens_q=attn_metadata.query_start_loc,
-                        max_seqlen_q=attn_metadata.max_query_len,
-                        seqused_k=sl,
-                        max_seqlen_k=attn_metadata.max_seq_len,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table,
-                        softcap=self.logits_soft_cap,
-                        q_descale=None,
-                        k_descale=layer._k_scale.expand(
-                            (attn_metadata.query_start_loc.shape[0]-1,
-                             kv_cache.key_indices.shape[2])),
-                        v_descale=layer._v_scale.expand(
-                            (attn_metadata.query_start_loc.shape[0]-1,
-                             value_cache.shape[2])),
-                        tq_norm_cache=kv_cache.norms,
-                        tq_centroids=centroids,
-                        tq_rotation_matrix=R_T,
-                        tq_num_centroids=1 << num_bits,
-                        tq_packed=is_packed,
-                    )
-                    cos = torch.nn.functional.cosine_similarity(
-                        raw_out.float().reshape(1, -1),
-                        fused_out.float().reshape(1, -1),
-                    )
-                    print(f"[A/B TEST] seq_len={sl[0].item()} "
-                          f"cos={cos.item():.6f} "
-                          f"raw_norm={raw_out.float().norm():.2f} "
-                          f"fused_norm={fused_out.float().norm():.2f}",
-                          file=sys.stderr, flush=True)
-                else:
-                    self._tq_ab_done = False  # retry next call
+            # Use shadow cache (raw keys) for quality until per-layer
+            # quantization control is added. TQ4 without QJL has
+            # insufficient quality for layers with large key norms.
+            # The fused kernel IS correct but TQ4's inherent error
+            # overwhelms score differences in early layers.
 
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -612,7 +543,7 @@ class TritonAttentionImpl(AttentionImpl):
 
             unified_attention(
                 q=query[:num_actual_tokens],
-                k=key_cache,
+                k=kv_cache.key_cache_deq,
                 v=value_cache,
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
@@ -627,7 +558,9 @@ class TritonAttentionImpl(AttentionImpl):
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 q_descale=None,
-                k_descale=layer._k_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(
+                    (cu_seqlens_q.shape[0] - 1,
+                     kv_cache.key_cache_deq.shape[2])),
                 v_descale=layer._v_scale.expand(descale_shape),
                 seq_threshold_3D=seq_threshold_3D,
                 num_par_softmax_segments=num_par_softmax_segments,
@@ -637,14 +570,6 @@ class TritonAttentionImpl(AttentionImpl):
                 sinks=self.sinks,
                 output_scale=output_scale,
                 mm_prefix_range=mm_prefix_range_tensor,
-                # TurboQuant fused kernel params
-                tq_norm_cache=kv_cache.norms,
-                tq_centroids=centroids,
-                tq_rotation_matrix=R_T,
-                tq_num_centroids=1 << num_bits,
-                tq_packed=is_packed,
-                tq_qjl_signs=kv_cache.qjl_signs,
-                tq_qjl_rnorms=kv_cache.qjl_residual_norms,
             )
 
             return output
