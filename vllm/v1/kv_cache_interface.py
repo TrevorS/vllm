@@ -196,7 +196,7 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
     """
 
     num_bits: int = 4
-    num_outlier_channels: int = 0  # >0 for tq4o (outlier separation)
+    num_outlier_channels: int = 0  # >0 for tq3/tq4o (outlier separation)
     value_dtype: torch.dtype = torch.bfloat16
     value_dtype_size: int = 2
 
@@ -218,32 +218,27 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         # Outlier channels: raw BF16 (only if outlier mode)
         outlier_bytes = self.block_size * self.num_kv_heads * n_out * 2
         # Normal channel indices: packed uint8
-        normal_idx_bytes = (
-            self.block_size * self.num_kv_heads * self.packed_key_dim
-        )
+        normal_idx_bytes = self.block_size * self.num_kv_heads * self.packed_key_dim
         # Norms: float16 (full norms for non-outlier, normal norms for outlier)
         norm_bytes = self.block_size * self.num_kv_heads * 2
         # Normal-part norms (only if outlier mode)
-        normal_norm_bytes = (
-            self.block_size * self.num_kv_heads * 2 if n_out > 0 else 0
-        )
+        normal_norm_bytes = self.block_size * self.num_kv_heads * 2 if n_out > 0 else 0
         # Values: BF16 or FP8
         value_bytes = (
-            self.block_size
-            * self.num_kv_heads
-            * self.head_size
-            * self.value_dtype_size
+            self.block_size * self.num_kv_heads * self.head_size * self.value_dtype_size
         )
         # QJL on normal channels
         qjl_dim = n_norm if n_out > 0 else self.head_size
-        qjl_sign_bytes = (
-            self.block_size * self.num_kv_heads * (qjl_dim // 8)
-        )
+        qjl_sign_bytes = self.block_size * self.num_kv_heads * (qjl_dim // 8)
         qjl_rnorm_bytes = self.block_size * self.num_kv_heads * 2
         return (
-            outlier_bytes + normal_idx_bytes + norm_bytes
-            + normal_norm_bytes + value_bytes
-            + qjl_sign_bytes + qjl_rnorm_bytes
+            outlier_bytes
+            + normal_idx_bytes
+            + norm_bytes
+            + normal_norm_bytes
+            + value_bytes
+            + qjl_sign_bytes
+            + qjl_rnorm_bytes
         )
 
     @classmethod

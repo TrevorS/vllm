@@ -6598,7 +6598,7 @@ class GPUModelRunner(
                     raw = raw_tensor
                     off = 0
 
-                    # Outlier cache (only for tq4o)
+                    # Outlier cache (for tq3 and tq4o)
                     outlier_cache = None
                     if use_outliers:
                         sz = nb * bs * nh * n_out * 2
@@ -6620,30 +6620,22 @@ class GPUModelRunner(
 
                     # Norms (full for standard, normal-part for outlier)
                     sz = nb * bs * nh * 2
-                    norms = (
-                        raw[off : off + sz]
-                        .view(torch.float16)
-                        .view(nb, bs, nh)
-                    )
+                    norms = raw[off : off + sz].view(torch.float16).view(nb, bs, nh)
                     off += sz
 
-                    # Normal norms (only for tq4o)
+                    # Normal norms (for tq3 and tq4o)
                     normal_norms_t = None
                     if use_outliers:
                         sz = nb * bs * nh * 2
                         normal_norms_t = (
-                            raw[off : off + sz]
-                            .view(torch.float16)
-                            .view(nb, bs, nh)
+                            raw[off : off + sz].view(torch.float16).view(nb, bs, nh)
                         )
                         off += sz
 
                     # Values
                     sz = nb * bs * nh * hd * vdtype_size
                     value_cache = (
-                        raw[off : off + sz]
-                        .view(value_dtype)
-                        .view(nb, bs, nh, hd)
+                        raw[off : off + sz].view(value_dtype).view(nb, bs, nh, hd)
                     )
                     off += sz
 
@@ -6658,9 +6650,7 @@ class GPUModelRunner(
                     off += sz
                     sz = nb * bs * nh * 2
                     qjl_rnorms = (
-                        raw[off : off + sz]
-                        .view(torch.float16)
-                        .view(nb, bs, nh)
+                        raw[off : off + sz].view(torch.float16).view(nb, bs, nh)
                     )
 
                     kv_caches[layer_name] = TurboQuantCache(

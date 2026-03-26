@@ -532,10 +532,13 @@ class Attention(nn.Module, AttentionLayerBase):
             )
 
             model_dtype = vllm_config.model_config.dtype
-            # tq4o: outlier separation (1/4 of head_dim channels)
+            # tq3 and tq4o: outlier separation (1/4 of head_dim channels)
+            # tq3 NEEDS outlier separation — 8 centroids alone have too
+            # much quantization error.  tq4 works fine without it.
             n_outlier = (
                 max(self.head_size // 4, 16)
-                if self.kv_cache_dtype == "tq4o" else 0
+                if self.kv_cache_dtype in ("tq3", "tq4o")
+                else 0
             )
             return TurboQuantAttentionSpec(
                 block_size=block_size,
@@ -546,9 +549,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 num_bits=num_bits_from_dtype_str(self.kv_cache_dtype),
                 num_outlier_channels=n_outlier,
                 value_dtype=model_dtype,
-                value_dtype_size=torch.tensor(
-                    [], dtype=model_dtype
-                ).element_size(),
+                value_dtype_size=torch.tensor([], dtype=model_dtype).element_size(),
             )
         else:
             return FullAttentionSpec(

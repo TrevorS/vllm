@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TurboQuant KV cache compression.
 
 Implements the TurboQuant algorithm (Google, ICLR 2026) for compressing
@@ -104,8 +105,7 @@ def _compute_lloyd_max_centroids(
     for _ in range(num_iterations):
         # Update boundaries: midpoints between consecutive centroids
         boundaries = [
-            (centroids[i] + centroids[i + 1]) / 2.0
-            for i in range(num_centroids - 1)
+            (centroids[i] + centroids[i + 1]) / 2.0 for i in range(num_centroids - 1)
         ]
 
         # Update centroids: conditional expectation within each partition
@@ -123,8 +123,7 @@ def _compute_lloyd_max_centroids(
         centroids = new_centroids
 
     boundaries = [
-        (centroids[i] + centroids[i + 1]) / 2.0
-        for i in range(num_centroids - 1)
+        (centroids[i] + centroids[i + 1]) / 2.0 for i in range(num_centroids - 1)
     ]
     return centroids, boundaries
 
@@ -144,13 +143,9 @@ def get_turboquant_params(
         boundaries: [2^num_bits - 1] float32
     """
     rotation_matrix = _build_rotation_matrix(head_dim, device, seed)
-    centroid_vals, boundary_vals = _compute_lloyd_max_centroids(
-        head_dim, num_bits
-    )
+    centroid_vals, boundary_vals = _compute_lloyd_max_centroids(head_dim, num_bits)
     centroids = torch.tensor(centroid_vals, dtype=torch.float32, device=device)
-    boundaries = torch.tensor(
-        boundary_vals, dtype=torch.float32, device=device
-    )
+    boundaries = torch.tensor(boundary_vals, dtype=torch.float32, device=device)
     return rotation_matrix, centroids, boundaries
 
 
@@ -175,9 +170,7 @@ def quantize_keys(
     boundaries: torch.Tensor,
     centroids: torch.Tensor | None = None,
     compute_qjl: bool = False,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
-]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Quantize key vectors using TurboQuant.
 
     Args:
@@ -203,9 +196,7 @@ def quantize_keys(
     rotated = torch.matmul(keys_unit, rotation_matrix.t())  # [N, H, D]
 
     # Quantize via searchsorted
-    indices = torch.searchsorted(boundaries, rotated.reshape(-1)).reshape(
-        rotated.shape
-    )
+    indices = torch.searchsorted(boundaries, rotated.reshape(-1)).reshape(rotated.shape)
     indices = indices.to(torch.uint8)
 
     qjl_sign_bits = None
@@ -356,9 +347,7 @@ def _pack_3bit_group(indices: torch.Tensor) -> torch.Tensor:
     """
     shape = indices.shape
     D = shape[-1]
-    assert D % 8 == 0, (
-        f"Dimension {D} must be divisible by 8 for 3-bit packing"
-    )
+    assert D % 8 == 0, f"Dimension {D} must be divisible by 8 for 3-bit packing"
 
     # Reshape to [..., D//8, 8] for group processing
     idx = indices.reshape(*shape[:-1], D // 8, 8).to(torch.int32)
@@ -366,9 +355,7 @@ def _pack_3bit_group(indices: torch.Tensor) -> torch.Tensor:
 
     # Pack 8 x 3-bit values into 3 bytes (24 bits)
     byte0 = ((i0 << 5) | (i1 << 2) | (i2 >> 1)).to(torch.uint8)
-    byte1 = (((i2 & 1) << 7) | (i3 << 4) | (i4 << 1) | (i5 >> 2)).to(
-        torch.uint8
-    )
+    byte1 = (((i2 & 1) << 7) | (i3 << 4) | (i4 << 1) | (i5 >> 2)).to(torch.uint8)
     byte2 = (((i5 & 3) << 6) | (i6 << 3) | i7).to(torch.uint8)
 
     # Stack and flatten: [..., D//8, 3] -> [..., D*3//8]
@@ -495,9 +482,7 @@ def dequantize_cache_blocks(
     rotated_approx = centroids[flat_indices.long()]  # [B*S*H, D] float32
 
     # Unrotate
-    keys_approx = torch.matmul(
-        rotated_approx, rotation_matrix
-    )  # [B*S*H, D]
+    keys_approx = torch.matmul(rotated_approx, rotation_matrix)  # [B*S*H, D]
 
     # Scale by norms
     keys_approx = keys_approx * flat_norms.float().unsqueeze(-1)
@@ -506,7 +491,7 @@ def dequantize_cache_blocks(
 
 
 # ---------------------------------------------------------------------------
-# Channel outlier separation (opt-in via tq4o)
+# Channel outlier separation (automatic for tq3, opt-in via tq4o)
 # ---------------------------------------------------------------------------
 
 # Per-layer outlier channel indices (detected at first real batch).
@@ -570,9 +555,11 @@ def quantize_and_store_outlier(
     safe_norms = normal_norms.clamp(min=1e-8)
     key_normal_unit = key_normal.float() / safe_norms.unsqueeze(-1)
     rotated = torch.matmul(key_normal_unit, rotation_matrix.t())
-    indices = torch.searchsorted(
-        boundaries, rotated.reshape(-1)
-    ).reshape(rotated.shape).to(torch.uint8)
+    indices = (
+        torch.searchsorted(boundaries, rotated.reshape(-1))
+        .reshape(rotated.shape)
+        .to(torch.uint8)
+    )
 
     # Scatter
     safe_slots = slot_mapping.clamp(min=0)
@@ -580,24 +567,22 @@ def quantize_and_store_outlier(
     block_offset = safe_slots % block_size
 
     # Store outlier raw
-    outlier_cache[block_idx, block_offset] = key_outlier.to(
-        outlier_cache.dtype
-    )
+    outlier_cache[block_idx, block_offset] = key_outlier.to(outlier_cache.dtype)
     # Store normal norms
-    normal_norm_cache[block_idx, block_offset] = normal_norms.to(
-        torch.float16
-    )
+    normal_norm_cache[block_idx, block_offset] = normal_norms.to(torch.float16)
     # Pack and store normal indices (pad to cache dim)
     num_normal = indices.shape[-1]
     cache_dim = normal_cache.shape[-1]
-    if num_bits == 4 and num_normal % 2 == 0:
+    if num_normal % 2 == 0:
         first = indices[..., : num_normal // 2]
         second = indices[..., num_normal // 2 :]
         packed = ((first << 4) | second).to(torch.uint8)
         if packed.shape[-1] < cache_dim:
             pad = torch.zeros(
-                *packed.shape[:-1], cache_dim - packed.shape[-1],
-                dtype=torch.uint8, device=packed.device,
+                *packed.shape[:-1],
+                cache_dim - packed.shape[-1],
+                dtype=torch.uint8,
+                device=packed.device,
             )
             packed = torch.cat([packed, pad], dim=-1)
         normal_cache[block_idx, block_offset] = packed
