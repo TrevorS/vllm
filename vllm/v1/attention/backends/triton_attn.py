@@ -484,6 +484,10 @@ class TritonAttentionImpl(AttentionImpl):
             R, centroids, boundaries = get_turboquant_params(
                 self.head_size, num_bits, query.device
             )
+            # Pre-transpose R for the kernel (avoids in-kernel transpose)
+            R_T = R.t().contiguous()
+
+            # (debug removed)
 
             # Key cache = packed uint8 indices, value cache = model dtype
             key_cache = kv_cache.key_indices
@@ -541,7 +545,7 @@ class TritonAttentionImpl(AttentionImpl):
                 # TurboQuant fused kernel params
                 tq_norm_cache=kv_cache.norms,
                 tq_centroids=centroids,
-                tq_rotation_matrix=R,
+                tq_rotation_matrix=R_T,
                 tq_num_centroids=1 << num_bits,
                 tq_packed=is_packed,
                 tq_qjl_signs=kv_cache.qjl_signs,

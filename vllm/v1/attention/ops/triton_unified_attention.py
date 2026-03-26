@@ -179,19 +179,19 @@ def kernel_unified_attention_2d(
         if TQ_PACKED or TQ_QJL:
             rot_col_first = tl.arange(0, TQ_HALF_D)
             rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
-            # Load R^T (transpose): R^T[row, col] = R[col, row]
+            # Load R^T directly (pre-transposed, row-major)
             R_first = tl.load(
                 tq_rotation_ptr
-                + rot_col_first[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_first[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_col_first[None, :] < HEAD_SIZE),
                 other=0.0,
             )
             R_second = tl.load(
                 tq_rotation_ptr
-                + rot_col_second[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_second[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_col_second[None, :] < HEAD_SIZE),
                 other=0.0,
@@ -199,12 +199,12 @@ def kernel_unified_attention_2d(
             Q_first = tl.dot(Q.to(tl.float32), R_first).to(Q.dtype)
             Q_second = tl.dot(Q.to(tl.float32), R_second).to(Q.dtype)
         else:
-            # Load R^T (transpose): R^T[row, col] = R[col, row]
+            # Load R^T directly (pre-transposed, row-major)
             rot_offs_col = tl.arange(0, HEAD_SIZE_PADDED)
             R_T = tl.load(
                 tq_rotation_ptr
-                + rot_offs_col[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_offs_col[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_offs_col[None, :] < HEAD_SIZE),
                 other=0.0,
@@ -654,19 +654,19 @@ def kernel_unified_attention_3d(
         if TQ_PACKED or TQ_QJL:
             rot_col_first = tl.arange(0, TQ_HALF_D)
             rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
-            # Load R^T (transpose): R^T[row, col] = R[col, row]
+            # Load R^T directly (pre-transposed, row-major)
             R_first = tl.load(
                 tq_rotation_ptr
-                + rot_col_first[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_first[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_col_first[None, :] < HEAD_SIZE),
                 other=0.0,
             )
             R_second = tl.load(
                 tq_rotation_ptr
-                + rot_col_second[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_col_second[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_col_second[None, :] < HEAD_SIZE),
                 other=0.0,
@@ -674,12 +674,12 @@ def kernel_unified_attention_3d(
             Q_first = tl.dot(Q.to(tl.float32), R_first).to(Q.dtype)
             Q_second = tl.dot(Q.to(tl.float32), R_second).to(Q.dtype)
         else:
-            # Load R^T (transpose): R^T[row, col] = R[col, row]
+            # Load R^T directly (pre-transposed, row-major)
             rot_offs_col = tl.arange(0, HEAD_SIZE_PADDED)
             R_T = tl.load(
                 tq_rotation_ptr
-                + rot_offs_col[None, :] * HEAD_SIZE
-                + rot_offs_row[:, None],
+                + rot_offs_row[:, None] * HEAD_SIZE
+                + rot_offs_col[None, :],
                 mask=(rot_offs_row[:, None] < HEAD_SIZE)
                 & (rot_offs_col[None, :] < HEAD_SIZE),
                 other=0.0,
