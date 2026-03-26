@@ -181,19 +181,29 @@ def kernel_unified_attention_2d(
     # TurboQuant: Q rotation or outlier split
     if TQ_KEYS:
         TQ_HALF_D: tl.constexpr = HEAD_SIZE_PADDED // 2
+        rot_offs_row = tl.arange(0, HEAD_SIZE_PADDED)
         if TQ_OUTLIER:
             # Q is pre-processed in Python as [Q_outlier | Q_normal_rot]
             # and passed via query_ptr. Re-load split parts directly.
             # Note: TQ_NUM_OUTLIER must be power of 2 (e.g., 32)
             TQ_NORMAL_D: tl.constexpr = HEAD_SIZE_PADDED - TQ_NUM_OUTLIER
             TQ_HALF_NORMAL: tl.constexpr = TQ_NORMAL_D // 2
-            # Outlier: first TQ_NUM_OUTLIER dims
             q_base = query_offset_0[:, None] * query_stride_0 + query_offset_1[:, None] * query_stride_1
             q_mask = query_mask_0[:, None] & query_mask_1[:, None]
+            # Outlier: first TQ_NUM_OUTLIER dims of pre-processed Q
             outlier_d = tl.arange(0, TQ_NUM_OUTLIER)
+            outlier_q_offset = (
+                query_offset_0[:, None] * query_stride_0
+                + query_offset_1[:, None] * query_stride_1
+                + outlier_d[None, :]
+            )
+            outlier_q_mask = (
+                query_mask_0[:, None] & query_mask_1[:, None]
+                & (outlier_d[None, :] < TQ_NUM_OUTLIER)
+            )
             Q_outlier_part = tl.load(
-                query_ptr + q_base + outlier_d[None, :],
-                mask=q_mask, other=0.0,
+                query_ptr + outlier_q_offset,
+                mask=outlier_q_mask, other=0.0,
             )
             # Normal first half
             nf_d = tl.arange(0, TQ_HALF_D) + TQ_NUM_OUTLIER
@@ -210,7 +220,7 @@ def kernel_unified_attention_2d(
                 mask=ns_mask, other=0.0,
             )
         elif TQ_PACKED or TQ_QJL:
-            Q_outlier_part = Q[:, :1]  # dummy, not used
+            pass  # Q_outlier_part initialized above
             rot_col_first = tl.arange(0, TQ_HALF_D)
             rot_col_second = tl.arange(0, TQ_HALF_D) + TQ_HALF_D
             # Load R^T directly (pre-transposed, row-major)
@@ -244,7 +254,7 @@ def kernel_unified_attention_2d(
                 other=0.0,
             )
             Q = tl.dot(Q.to(tl.float32), R_T).to(Q.dtype)
-            Q_outlier_part = Q[:, :1]  # dummy, not used
+            pass  # Q_outlier_part initialized above
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -822,7 +832,7 @@ def kernel_unified_attention_3d(
                 other=0.0,
             )
             Q = tl.dot(Q.to(tl.float32), R_T).to(Q.dtype)
-            Q_outlier_part = Q[:, :1]  # dummy, not used
+            pass  # Q_outlier_part initialized above
 
     block_table_offset = seq_idx * block_table_stride
 
