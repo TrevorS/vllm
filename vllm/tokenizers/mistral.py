@@ -23,6 +23,7 @@ from mistral_common.tokens.tokenizers.base import (
 from mistral_common.tokens.tokenizers.instruct import (
     InstructTokenizerBase,
     InstructTokenizerV13,
+    InstructTokenizerV15,
 )
 from mistral_common.tokens.tokenizers.mistral import (
     MistralTokenizer as MistralCommonTokenizer,
@@ -548,7 +549,7 @@ class MistralTokenizer(TokenizerLike):
         non_skip_special_tokens_ids = {
             self.tokenizer.get_special_token(SpecialTokens.tool_calls),
         }
-        if isinstance(self.instruct, InstructTokenizerV13):
+        if isinstance(self.instruct, (InstructTokenizerV13, InstructTokenizerV15)):
             if self.instruct.BEGIN_THINK:
                 non_skip_special_tokens_ids.add(self.instruct.BEGIN_THINK)
             if self.instruct.END_THINK:

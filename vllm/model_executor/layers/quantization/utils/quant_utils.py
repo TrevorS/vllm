@@ -382,9 +382,12 @@ def get_and_maybe_dequant_weights(
     #   quantizing 1.0 may lead to over/underflows
     # - Should only be used offline, since it's O(N^3)
     assert hasattr(layer, "input_size_per_partition")
+    # Use bf16 for the identity matrix input — Marlin FP8 kernels reject float32.
+    # The result is cast to out_dtype after the forward pass.
+    apply_dtype = torch.bfloat16 if out_dtype not in (torch.float16, torch.bfloat16) else out_dtype
     eye = torch.eye(
         layer.input_size_per_partition,
-        dtype=out_dtype,
+        dtype=apply_dtype,
         device=weight.device,
     )
     dequant_weights = layer.quant_method.apply(layer, eye, bias=None).to(out_dtype)

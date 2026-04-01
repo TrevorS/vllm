@@ -414,7 +414,7 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
         capability = current_platform.get_device_capability()
-        if capability is not None and capability.major == 10:
+        if capability is not None and capability.major in (10, 12):
             return "HND"
         return None
 
@@ -1179,6 +1179,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
+
+    # SM121 MTP fix: Reset FlashInfer decode wrapper plan cache before
+    # each draft step. This forces fast_plan_decode() to call the full
+    # plan() method instead of reusing the cached execution plan.
+    def _reset_draft_plan_cache(self) -> None:
+        if hasattr(self, '_decode_wrapper') and self._decode_wrapper is not None:
+            self._decode_wrapper.vllm_first_call = True
+        if hasattr(self, '_decode_wrappers_cudagraph'):
+            for wrapper in self._decode_wrappers_cudagraph.values():
+                wrapper.vllm_first_call = True
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         if self.kv_cache_spec.dtype != self.vllm_config.model_config.dtype:

@@ -626,11 +626,22 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 For tree-based attention, this index instead refers to the
                 draft attempt for the i-th level in the tree of tokens.
         """
+        # SM121 MTP fix: Force fresh FlashInfer plan() on each draft step.
+        # Without this, fast_plan_decode() reuses a cached execution plan
+        # that becomes stale when KV cache layout changes, causing illegal
+        # memory access on SM121 (DGX Spark).
+        self._reset_draft_plan_cache()
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
             fast_build=True,
         )
+
+    def _reset_draft_plan_cache(self) -> None:
+        """Reset FlashInfer wrapper plan cache for draft step.
+        Override in backends that cache execution plans (e.g., FlashInfer).
+        """
+        pass
 
     def use_cascade_attention(
         self,

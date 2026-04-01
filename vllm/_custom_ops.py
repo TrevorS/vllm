@@ -1889,6 +1889,10 @@ def scaled_fp8_quant(
             scaling factor.
     """
     # This code assumes batch_dim and num_tokens are flattened
+    # EAGLE spec decode may pass 3D tensors — flatten to 2D
+    input_shape = input.shape
+    if input.ndim == 3:
+        input = input.reshape(-1, input_shape[-1])
     assert input.ndim == 2
     shape: tuple[int, int] | torch.Size = input.shape
     # For ROCm on MI300, the output fp8 dtype is torch.float_e3m3fnuz

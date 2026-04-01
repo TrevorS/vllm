@@ -732,13 +732,16 @@ class ModuleName(OpaqueBase):  # type: ignore[misc]
         return hash(self.value)
 
     def __fx_repr__(self):
-        return (f"ModuleName({self.value!r})", {ModuleName})
+        return (f"ModuleName({self.value!r})", {"ModuleName": ModuleName})
 
 
 if HAS_OPAQUE_TYPE:
     from torch._library.opaque_object import register_opaque_type
 
-    register_opaque_type(ModuleName, typ="value", hoist=True)
+    try:
+        register_opaque_type(ModuleName, typ="value", hoist=True)
+    except TypeError:
+        register_opaque_type(ModuleName, typ="value")  # fallback without hoist= for NGC PyTorch 2.11
 
 
 # Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform
