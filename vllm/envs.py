@@ -210,6 +210,8 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
+    VLLM_NVFP4_ATTN: bool = False
+    VLLM_NVFP4_SKIP_EAGLE_GUARD: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
@@ -1480,6 +1482,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "marlin",
             "emulation",
         ],
+    ),
+    # Runtime NVFP4 conversion of BF16 attention projections via the strieber
+    # _nvfp4_convert_attention hook in linear.py. Used for NVIDIA-recipe
+    # checkpoints where self_attn layers are excluded from modelopt NVFP4
+    # serialization and stay in BF16 on disk.
+    "VLLM_NVFP4_ATTN": lambda: bool(int(os.getenv("VLLM_NVFP4_ATTN", "0"))),
+    # Bypass the EAGLE draft-head guard in _nvfp4_should_convert for models
+    # like Gemma 4 whose main layers live at model.layers.N.* (no
+    # language_model. prefix) and which ship no Eagle3 head.
+    "VLLM_NVFP4_SKIP_EAGLE_GUARD": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_SKIP_EAGLE_GUARD", "0"))
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
