@@ -29,11 +29,19 @@ from vllm.model_executor.layers.quantization.base_config import (
 # --- Runtime NVFP4 for attention projections (VLLM_NVFP4_ATTN=1) ---
 import os as _os
 _NVFP4_ATTN_ENABLED = _os.environ.get("VLLM_NVFP4_ATTN", "0") == "1"
+# Bypass the EAGLE draft-head guard below. Needed for models like Gemma 4
+# whose main layers live at "model.layers.N.*" (no "language_model." prefix)
+# and which ship no Eagle3 head, so the guard would otherwise reject every
+# attention projection.
+_NVFP4_SKIP_EAGLE_GUARD = _os.environ.get("VLLM_NVFP4_SKIP_EAGLE_GUARD", "0") == "1"
 _NVFP4_ATTN_PATTERNS = (
     # Main model attention projections (BF16 in checkpoint)
     ".q_a_proj", ".q_b_proj", ".kv_a_proj", ".kv_b_proj",
     ".wq_a", ".wq_b", ".wkv_a", ".wkv_b",
     "fused_qkv_a_proj",
+    # Gemma 4 / standard attention: fused qkv_proj, or separate q/k/v on
+    # k_eq_v sliding-window layers (see gemma4.py k_eq_v_layer_indices)
+    ".qkv_proj", ".q_proj", ".k_proj", ".v_proj",
     ".o_proj", ".wo",
     "lm_head",
     # NOTE: EAGLE head FP8 layers NOT included — dequant from Marlin FP8 → NVFP4
@@ -46,7 +54,8 @@ def _nvfp4_should_convert(prefix: str) -> bool:
     # Exclude EAGLE draft head layers — FP8→NVFP4 dequant produces bad weights
     # EAGLE layers: "model.layers.36.*" (no "language_model" prefix)
     # Main model: "language_model.model.layers.0-35.*"
-    if prefix.startswith("model.layers.") and not prefix.startswith("language_model."):
+    if not _NVFP4_SKIP_EAGLE_GUARD and prefix.startswith("model.layers.") \
+            and not prefix.startswith("language_model."):
         return False
     return any(p in prefix for p in _NVFP4_ATTN_PATTERNS)
 
