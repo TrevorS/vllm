@@ -60,7 +60,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.utils import KVSharingFastPrefillMetadata
 
-from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
+from .interfaces import (EagleModelMixin, MixtureOfExperts, SupportsEagle3,
+                         SupportsLoRA, SupportsPP)
 from .utils import (
     AutoWeightsLoader,
     extract_layer_index,
@@ -838,7 +839,7 @@ class Gemma4CrossDecoderLayers(nn.Module):
 @support_torch_compile(
     enable_if=lambda vllm_config: not vllm_config.cache_config.kv_sharing_fast_prefill
 )
-class Gemma4Model(nn.Module):
+class Gemma4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = _get_text_config(vllm_config.model_config.hf_config)
@@ -1204,6 +1205,9 @@ class Gemma4Model(nn.Module):
             residual = intermediate_tensors["residual"]
             per_layer_inputs = intermediate_tensors.get("per_layer_inputs")
 
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], self.start_layer, hidden_states, residual)
+
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
@@ -1222,6 +1226,10 @@ class Gemma4Model(nn.Module):
                 per_layer_input=layer_per_input,
                 **kwargs,
             )
+            aux_hidden_states = self._maybe_add_hidden_state(
+                aux_hidden_states, self.start_layer + layer_idx + 1,
+                hidden_states, residual)
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {
@@ -1236,6 +1244,8 @@ class Gemma4Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1366,7 +1376,8 @@ class Gemma4Model(nn.Module):
         return loaded_params
 
 
-class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
+class Gemma4ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts,
+                        SupportsEagle3):
     # Note: qkv_proj packing applies to non-k_eq_v layers (sliding
     # attention and full attention without k_eq_v). k_eq_v layers use
     # separate q_proj + k_proj without packing.
