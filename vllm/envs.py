@@ -173,6 +173,8 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
     VLLM_USE_FLASHINFER_MOE_FP8: bool = False
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
+    VLLM_NVFP4_ATTN: bool = False
+    VLLM_NVFP4_SKIP_EAGLE_GUARD: bool = False
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput", "latency", "masked_gemm"] = (
         "latency"
@@ -1279,6 +1281,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_FP4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))
+    ),
+    # Runtime NVFP4 conversion for bf16 attention projections.
+    "VLLM_NVFP4_ATTN": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_ATTN", "0"))
+    ),
+    # Skip the EAGLE draft-head guard in NVFP4 attention hook.
+    "VLLM_NVFP4_SKIP_EAGLE_GUARD": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_SKIP_EAGLE_GUARD", "0"))
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(

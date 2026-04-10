@@ -25,6 +25,88 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+
+# --- Runtime NVFP4 for attention projections (VLLM_NVFP4_ATTN=1) ---
+import os as _os
+_NVFP4_ATTN_ENABLED = _os.environ.get("VLLM_NVFP4_ATTN", "0") == "1"
+_NVFP4_SKIP_EAGLE_GUARD = _os.environ.get("VLLM_NVFP4_SKIP_EAGLE_GUARD", "0") == "1"
+_NVFP4_ATTN_PATTERNS = (
+    ".q_a_proj", ".q_b_proj", ".kv_a_proj", ".kv_b_proj",
+    ".wq_a", ".wq_b", ".wkv_a", ".wkv_b",
+    "fused_qkv_a_proj",
+    ".qkv_proj", ".q_proj", ".k_proj", ".v_proj",
+    ".o_proj", ".wo",
+    "lm_head",
+)
+
+def _nvfp4_should_convert(prefix: str) -> bool:
+    if not _NVFP4_ATTN_ENABLED:
+        return False
+    if not _NVFP4_SKIP_EAGLE_GUARD and prefix.startswith("model.layers.") \
+            and not prefix.startswith("language_model."):
+        return False
+    return any(p in prefix for p in _NVFP4_ATTN_PATTERNS)
+
+def _nvfp4_convert_attention(layer) -> None:
+    import torch
+    from vllm._custom_ops import scaled_fp4_quant
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        NvFp4LinearBackend,
+        convert_to_nvfp4_linear_kernel_format,
+    )
+    from vllm.model_executor.utils import replace_parameter
+
+    weight_raw = layer.weight.data
+    if weight_raw.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        weight_bf16 = weight_raw
+    else:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            get_and_maybe_dequant_weights,
+        )
+        try:
+            weight_bf16 = get_and_maybe_dequant_weights(layer, torch.bfloat16)
+        except Exception as e:
+            logger.warning("NVFP4: cannot dequant %s (%s), skipping",
+                          getattr(layer, "prefix", "?"), e)
+            return
+
+    absmax = weight_bf16.abs().max().float()
+    weight_global_scale = (absmax / (6.0 * 448.0)).clamp(min=1e-12)
+    input_global_scale = torch.ones(1, device=weight_bf16.device, dtype=torch.float32)
+
+    weight_fp4, weight_block_scale = scaled_fp4_quant(
+        weight_bf16.to(torch.bfloat16),
+        (1.0 / weight_global_scale).to(weight_bf16.device),
+        is_sf_swizzled_layout=False,
+    )
+
+    replace_parameter(layer, "weight",
+                      torch.nn.Parameter(weight_fp4, requires_grad=False))
+    layer.weight_scale = torch.nn.Parameter(weight_block_scale, requires_grad=False)
+    layer.weight_global_scale = torch.nn.Parameter(
+        weight_global_scale.reshape(1), requires_grad=False)
+    layer.input_global_scale_inv = torch.nn.Parameter(
+        (1.0 / input_global_scale).reshape(1), requires_grad=False)
+    layer.alpha = torch.nn.Parameter(
+        (input_global_scale * weight_global_scale).reshape(1), requires_grad=False)
+    layer.output_size_per_partition = weight_bf16.shape[0]
+    layer.input_size_per_partition = weight_bf16.shape[1]
+
+    if not hasattr(layer, "params_dtype"):
+        layer.params_dtype = torch.bfloat16
+    convert_to_nvfp4_linear_kernel_format(NvFp4LinearBackend.MARLIN, layer)
+    layer._use_nvfp4_attn = True
+    torch.cuda.synchronize()
+    logger.info("NVFP4 attention: quantized %s [%s] -> Marlin FP4",
+                getattr(layer, "prefix", "?"), list(weight_bf16.shape))
+
+def _nvfp4_apply_attention(layer, x, bias=None):
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        NvFp4LinearBackend, apply_nvfp4_linear,
+    )
+    return apply_nvfp4_linear(NvFp4LinearBackend.MARLIN, layer, x, bias)
+# --- End NVFP4 attention ---
+
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
 )
